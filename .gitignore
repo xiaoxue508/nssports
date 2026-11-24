@@ -1,0 +1,18 @@
+# Game assets, keys, references, toolchains, generated C, and build outputs
+rom/
+keys/
+refs/
+toolchain/
+build/
+generated/
+.venv/
+.venv-py314/
+config.local.toml
+*.ini
+!nssports.ini.example
+*.log
+*.dmp
+__pycache__/
+*.pyc
+.vs/
+*.user

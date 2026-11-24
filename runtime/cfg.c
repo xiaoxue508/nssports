@@ -1,0 +1,902 @@
+// totk.ini: file-backed defaults for the TOTK_* environment variables (docs/controls.md, totk.ini.example).
+// Format: "key = value" lines, '#' or ';' at the start of a line begins a comment, [sections] only group. A key is a
+// variable name without "TOTK_" (an optional TOTK_ prefix is accepted), case-insensitive. A value is the rest of the
+// line, trimmed, optionally in double quotes; an empty value counts as unset. The environment wins over the file.
+//
+// Live settings: cfg_set changes a value in memory (readers see the new pointer; the old string is kept, so a pointer
+// cfg_get handed out stays valid) and cfg_save writes only the changed keys back, keeping the rest of the file.
+// Readers take no lock: an entry is complete before n_entries counts it, and value pointers are swapped atomically.
+#include <ctype.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "cfg.h"
+#include "host.h"
+#include "input_map.h"
+#include "platform/platform.h"
+
+#define PREFIX "TOTK_"
+#define PREFIX_LEN 5
+#define NSS_PREFIX "NSS_"
+#define NSS_PREFIX_LEN 4
+#define CFG_MAX_KEYS 512
+
+typedef struct { char *key, *value; int dirty, removed; } CfgEntry;   // key upper-case, without the prefix; value NULL after cfg_reset
+
+static CfgEntry entries[CFG_MAX_KEYS];
+static int n_entries;
+static unsigned version;
+static PlatMutex set_lock = PLAT_MUTEX_INIT;   // cfg_set, cfg_reset, cfg_save
+static int save_ok = 1;                         // the last cfg_save_to wrote (or had nothing to write)
+
+// Every name the runtime reads (and the patch sets in generated/), without the prefix. A file key outside this list is
+// logged as unknown. A new variable goes here too, or its ini key logs a harmless "unknown key" line, and gets a
+// description in totk.ini.example or docs/settings.md (tests/settings_doc_check.py checks both).
+static const char *const known[] = {
+    "AB", "ABILITY_GUARD", "ADDR_REPORT", "AMIIBO_DIR", "ANISO", "APP_POOL", "ASPECT", "ASPECT_PATCH", "ASSUME_FOCUS", "ASTC", "ASTC_BC", "ASTC_TIME", "ASYNC_PREEMPT", "AUDIO", "AUDIO_CHANNELS", "AUDIO_DEVICE", "AUDIO_DRAIN_FIX", "AUDIO_OFF", "AUDIO_PREFILL_MS",
+    "BACKGROUND_WINDOW", "BIND_A", "BIND_B", "BIND_DOWN", "BIND_L", "BIND_LCLICK", "BIND_LEFT", "BIND_LSTICK_DOWN", "BIND_LSTICK_LEFT",
+    "BIND_LSTICK_RIGHT", "BIND_LSTICK_UP", "BIND_MINUS",
+    "BIND_PLUS", "BIND_R", "BIND_RCLICK", "BIND_RIGHT", "BIND_RSTICK_DOWN", "BIND_RSTICK_LEFT", "BIND_RSTICK_RIGHT", "BIND_RSTICK_UP",
+    "BIND_SHAKE",
+    "BIND_INC", "BIND_SKIP", "BIND_STATS", "BIND_UP", "BIND_X", "BIND_Y",
+    "BIND_ZL", "BIND_ZR", "BARRIER_MERGE", "BLOCK_VIEWS_3D", "CLIMB_FIX", "CLOTH_REALTIME", "COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_GAMMA",
+    "COLOR_PRESET", "COLOR_SATURATION", "CONTACT_DEBUG", "CONTACT_SHADOWS", "CORE_DIAG", "CRIT", "CRIT_OUT",
+    "DESC_TEMPLATE", "DESWIZZLE", "DEVICE_PROFILE", "DIALOGUE_CLICK", "DISCORD_APP_ID", "DISCORD_IMAGE", "DISCORD_RPC", "DLAA", "DLAA_CAM_JITTER", "DLAA_EFFECTS_AFTER", "DLAA_JITTER", "DLAA_MV", "DLAA_MASKDEBUG", "DLAA_MVDEBUG", "DLAA_OBJMV", "DLAA_SURVEY", "DLAA_TIMES", "DLSS", "DLSS_CHAR_MASK", "DLSS_FIXED_EXPOSURE", "DLSS_PRESET", "DLSS_REACTIVE", "DUMP", "DUMP_BUF", "DUMP_DIR",
+    "DUMP_LOG", "DYNAMIC_RES", "DYN_DELTA", "EXEFS", "FEEDBACK", "FG_DEBUG", "FG_OBJECTS", "FG_SHOT", "FG_SHOT_DIR", "FG_TEST", "FG_TIMES", "FIXED_RES_PATCH", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES",
+    "FLIGHT_SPIKE_MS", "FLIGHT_THUMBS", "FLUSH_SPAN", "FOV", "FOV_PATCH", "FPS60", "FPS_LIMIT", "FRAME_GEN", "FRAME_QUEUE", "FREECAM_KEY", "FREECAM_PAD", "FREECAM_PATCH",
+    "FREEZE_IDLE", "FREE_CORES", "FSR3_DEBUG", "FSR3_VIEW", "FSR_SHARPNESS",
+    "FULLSCREEN", "FXAA",
+    "GAMEPLAY_DISTANCE_SENSITIVITY", "GAMEPLAY_ITEM_AD", "GAMEPLAY_ITEM_SENSITIVITY", "GAMEPLAY_ITEM_WHEEL",
+    "GAMEPLAY_MAP_ZOOM", "GAMEPLAY_MAP_ZOOM_SENSITIVITY", "GAMEPLAY_ROTATION_SENSITIVITY", "GAMEPLAY_TWEAKS_ENABLED",
+    "GAMEPLAY_ULTRAHAND_C_AXIS", "GAMEPLAY_ULTRAHAND_DISTANCE", "GAMEPLAY_ULTRAHAND_ROTATE", "GAMEPLAY_WEAPON_SENSITIVITY",
+    "GAMEPLAY_WEAPON_WHEEL",
+    "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_INDEX", "GPU_NAME", "GRASS_RANGE",
+    "GYRO_AUTO_BIAS", "GYRO_BIAS_PAD", "GYRO_BIAS_X", "GYRO_BIAS_Y", "GYRO_BIAS_Z", "GYRO_CALIBRATION", "HDR", "HDR_GAME_NITS", "HDR_HUE",
+    "HDR_PEAK_NITS", "HDR_UI_NITS", "HIGHFPS_FIX", "HUD_WIDTH", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "JOYCON_DRIVER", "JOYCON_MODE", "KBM_MOTION_SENS", "KEYS", "KSPIN_US", "LANG", "LIB_PREBUILD",
+    "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LOCALE", "LOD_GUARD", "LOD_STEADY", "LSTICK_DEADZONE", "MAP_CLICK", "MEMORY", "MEMX", "MENU_LANG", "MENU_TEST", "MENU_FONT_FONTCONFIG",
+    "MEM_RESERVE_MIB", "MENU_CURSOR", "MENU_CURSOR_LOG", "MENU_TEST_DIR", "MENU_TEST_SET", "MINIMAL_LAYOUT", "MIRROR_GAP", "MODS_DIR", "MODS_DISABLED", "MODS_NO_CODE", "MODS_ORDER", "MODS_REBUILD", "MODS_WITHOUT_CODE", "MOTION", "MOUSE_AIM_SCALE", "MOUSE_MODE", "MOUSE_DIRECT_PATCH", "MOUSE_SENS", "MOVIE_ASPECT", "MOVIE_HOST", "MOVIE_PACE",
+    "MVOBJ_ALL", "MVOBJ_BANKS", "MVOBJ_EQUAL", "MVOBJ_EXACT", "MVOBJ_EXEC", "MVOBJ_NOC4", "MVOBJ_ONLY", "MVOBJ_TIMES", "MVPREV_CHECK", "MVPREV_GROW", "MVPREV_SKIP", "MVPREV_TRUST", "MV_CHECK",
+    "MV_SURVEY",
+    "ONE_PER_CORE", "OPERATION_MODE", "OPTREF_GUARD", "OUTPUT_RES", "PAD_LAYOUT", "PASS_CRUMBS", "PATCH_OUTPUT", "PATCH_SCENE", "PCORE", "PCSS", "PCSS_K", "PERF_CENSUS", "PERF_OVERLAY", "PERF_SLOW_MS", "PIPELINE_CACHE", "PIPE_MEMO", "PIPE_PREBUILD", "PIPE_SKIP", "PIPE_SYNC", "PIPE_WAIT", "PLUGIN_TICK_OFFSET", "PLUGIN_TRACE", "POINTER_IMAGE",
+    "PREWARM_XLATE", "PROBE_MOVIE", "PROBE_MOVIE_BENCH", "PROBE_MOVIE_SHOT", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES",
+    "PROFILE_MAIN", "PROFILE_RENDER", "PROMPTS", "PUSH_SKIP", "PUSH_STAGE", "QUICKLOAD_KEY", "QUICKSAVE", "QUICKSAVE_KEY", "RDOC", "RDOC_DIR", "RDOC_DLL", "REALTIME", "REC_ASYNC", "REC_END", "REC_SPIN_US", "REEXEC", "REFLEX",
+    "RENDER_SCALE", "REPLAY_ASYNC", "REPLAY_CHUNKS", "REPLAY_CHUNK_DRAWS", "REPLAY_SKEW_US", "REPLAY_STATE_CHECK", "REPLAY_WORKERS",
+    "REPLAY_CHECK", "REPORT_GUARD", "RESOLVE_CHECK", "RESTART_WAIT", "ROMFS", "ROMFS_INDEX", "ROMFS_MMAP", "ROMFS_MODS", "ROMFS_PATCHES",
+    "ROMFS_PROOF_DIR", "ROMFS_VERIFY", "RSTICK_DEADZONE", "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS", "SCENE_UPSCALER", "SHADER_CACHE",
+    "SHADER_MEMO", "SHADOW", "SHADOW_DEFER", "SHADOW_RANGE", "SHADOW_RES", "SHADOW_SCALE", "SHADOW_SNAP", "SHARED_FONTS", "SHARPNESS", "SHOTS", "SHOTS_DIR", "SHUTTER_FIX",
+    "SHOTS_FULL", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STICK_DEADZONE", "STICK_SENS",
+    "SWKBD_ANSWER", "SYNC_AHEAD",
+    "SWKBD_TEST", "TEST_OOM", "TEST_PAD", "TEST_PAD_RUMBLE_MS", "TEST_PREPARE_SHADERS", "TEX_ALIAS", "TEX_BLOCK_MIB", "TEX_HEAP_EXTRA_MB", "TEX_MEMO", "TEX_RELEASED_MIB", "TEX_VRAM_PRESSURE", "TIMER_1MS", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "UB_OVERLAY", "UB_OVERLAY_OUT", "UPSCALER", "VB_USED", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
+    "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VMA_BLOCK_MIB", "VOLUME", "VOLUME_MASK_BIAS", "VOLUME_MUSIC", "VOLUME_SFX", "VOLUME_VOICE", "VRAM_HEADROOM", "VRAM_LIMIT_MIB", "VS_OUTS",
+    "WALK_KEY", "WALK_SCALE", "WB_EAGER", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
+    "ZSTD_CHECK", "ZSTD_NATIVE",
+};
+
+// The totk.ini section a key cfg_set may write goes to when the file lacks it (totk.ini.example's sections).
+static const struct { const char *key, *section; } sections[] = {
+    {"FPS_LIMIT", "frame rate"}, {"FPS60", "frame rate"}, {"FRAME_QUEUE", "frame rate"}, {"FRAME_GEN", "frame rate"},
+    {"REALTIME", "frame rate"}, {"CLOTH_REALTIME", "frame rate"}, {"HIGHFPS_FIX", "frame rate"},
+    {"CLIMB_FIX", "frame rate"}, {"AUDIO_DRAIN_FIX", "frame rate"}, {"SHUTTER_FIX", "frame rate"},
+    {"FULLSCREEN", "display"}, {"WINDOW_SIZE", "display"}, {"PERF_OVERLAY", "display"}, {"VK_PRESENT", "display"},
+    {"GPU_INDEX", "display"}, {"OUTPUT_RES", "display"}, {"RENDER_SCALE", "display"}, {"UPSCALER", "display"},
+    {"HUD_WIDTH", "display"},
+    {"SHARPNESS", "display"}, {"DYNAMIC_RES", "display"}, {"ASPECT", "display"}, {"MOVIE_ASPECT", "display"}, {"FOV", "display"}, {"ANISO", "display"},
+    {"LOD_STEADY", "display"}, {"COLOR_PRESET", "display"},
+    {"COLOR_BRIGHTNESS", "display"}, {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"},
+    {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_PEAK_NITS", "display"}, {"HDR_GAME_NITS", "display"},
+    {"HDR_UI_NITS", "display"}, {"HDR_HUE", "display"}, {"SHADOW_RES", "display"},
+    {"SCENE_UPSCALER", "display"}, {"DLAA", "display"}, {"DLSS", "display"}, {"FSR_SHARPNESS", "display"}, {"DLSS_PRESET", "display"}, {"DLSS_CHAR_MASK", "display"}, {"DLSS_FIXED_EXPOSURE", "display"}, {"DLAA_EFFECTS_AFTER", "display"}, {"REFLEX", "display"}, {"FXAA", "display"},
+    {"DEVICE_PROFILE", "display"}, {"ASSUME_FOCUS", "display"},
+    {"DISCORD_RPC", "discord"}, {"DISCORD_APP_ID", "discord"}, {"DISCORD_IMAGE", "discord"},
+    {"SHADOW_SCALE", "display"}, {"SHADOW_RANGE", "display"}, {"GRASS_RANGE", "display"}, {"CONTACT_SHADOWS", "display"},
+    {"PCSS", "display"},
+    {"MODS_DIR", "mods"}, {"MODS_ORDER", "mods"}, {"MODS_DISABLED", "mods"}, {"MODS_NO_CODE", "mods"}, {"MODS_REBUILD", "mods"}, {"MODS_WITHOUT_CODE", "mods"},
+    {"TEX_HEAP_EXTRA_MB", "mods"},
+    {"MENU_LANG", "language"}, {"MENU_FONT_FONTCONFIG", "language"}, {"LANG", "language"}, {"OPERATION_MODE", "language"},
+    {"VOLUME", "audio"}, {"VOLUME_MUSIC", "audio"}, {"VOLUME_SFX", "audio"}, {"VOLUME_VOICE", "audio"}, {"AUDIO_CHANNELS", "audio"},
+    {"AUDIO_DEVICE", "audio"},
+    {"MOTION", "input"}, {"JOYCON_DRIVER", "input"}, {"JOYCON_MODE", "input"}, {"KBM_MOTION_SENS", "input"}, {"KEYS", "input"}, {"GYRO_CALIBRATION", "input"}, {"GYRO_AUTO_BIAS", "input"}, {"RUMBLE_STRENGTH", "input"}, {"RUMBLE_CURVE", "input"}, {"RUMBLE_TRIGGERS", "input"},
+    {"GYRO_BIAS_X", "input"}, {"GYRO_BIAS_Y", "input"}, {"GYRO_BIAS_Z", "input"}, {"GYRO_BIAS_PAD", "input"},
+    {"PAD_LAYOUT", "input"}, {"PROMPTS", "input"}, {"STICK_DEADZONE", "input"}, {"LSTICK_DEADZONE", "input"}, {"RSTICK_DEADZONE", "input"},
+    {"STICK_SENS", "input"},
+    {"MENU_CURSOR", "input"}, {"MAP_CLICK", "input"}, {"DIALOGUE_CLICK", "input"}, {"POINTER_IMAGE", "input"}, {"QUICKSAVE", "input"}, {"QUICKSAVE_KEY", "input"}, {"QUICKLOAD_KEY", "input"}, {"MOUSE_MODE", "input"}, {"MOUSE_SENS", "input"}, {"MOUSE_AIM_SCALE", "input"}, {"WALK_KEY", "input"}, {"WALK_SCALE", "input"}, {"FREECAM_PATCH", "input"}, {"FREECAM_PAD", "input"}, {"FREECAM_KEY", "input"}, {"INPUT_RECORD", "input"},
+    {"BIND_A", "input"}, {"BIND_B", "input"}, {"BIND_X", "input"}, {"BIND_Y", "input"}, {"BIND_LCLICK", "input"},
+    {"BIND_RCLICK", "input"}, {"BIND_L", "input"}, {"BIND_R", "input"}, {"BIND_ZL", "input"}, {"BIND_ZR", "input"},
+    {"BIND_PLUS", "input"}, {"BIND_MINUS", "input"}, {"BIND_LEFT", "input"}, {"BIND_UP", "input"},
+    {"BIND_RIGHT", "input"}, {"BIND_DOWN", "input"}, {"BIND_LSTICK_LEFT", "input"}, {"BIND_LSTICK_UP", "input"},
+    {"BIND_LSTICK_RIGHT", "input"}, {"BIND_LSTICK_DOWN", "input"}, {"BIND_RSTICK_LEFT", "input"},
+    {"BIND_RSTICK_UP", "input"}, {"BIND_RSTICK_RIGHT", "input"}, {"BIND_RSTICK_DOWN", "input"}, {"BIND_SHAKE", "input"},
+    {"ASYNC_PREEMPT", "performance"}, {"REPLAY_ASYNC", "performance"}, {"REPLAY_WORKERS", "performance"}, {"FREE_CORES", "performance"},
+    {"TIMER_1MS", "performance"}, {"PIPE_WAIT", "performance"}, {"PIPE_SKIP", "performance"},
+    {"BARRIER_MERGE", "performance"}, {"LIB_PREBUILD", "performance"}, {"LIB_PREBUILD_THREADS", "performance"}, {"PIPE_PREBUILD", "performance"},
+    {"PREWARM_XLATE", "performance"}, {"GPL", "performance"}, {"ASTC", "performance"}, {"MEMORY", "performance"},
+    {"TEX_ALIAS", "performance"}, {"TEX_VRAM_PRESSURE", "performance"}, {"TEX_RELEASED_MIB", "performance"}, {"TEX_BLOCK_MIB", "performance"}, {"VMA_BLOCK_MIB", "performance"}, {"ASTC_BC", "performance"}, {"LOD_GUARD", "performance"}, {"FIX_C0", "performance"}, {"FIX_ZERO", "performance"},
+    {"BIND_SKIP", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"MEMX", "performance"}, {"BIND_INC", "performance"}, {"TEX_MEMO", "performance"}, {"VB_USED", "performance"}, {"DESC_TEMPLATE", "performance"},
+    {"SYNC_AHEAD", "performance"}, {"SHADOW_DEFER", "performance"}, {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
+    {"VK_DYN_VERTEX", "performance"}, {"VK_DYN_A2C", "performance"}, {"VK_SUBGROUP_PIN", "performance"},
+    {"OPTREF_GUARD", "performance"}, {"ABILITY_GUARD", "performance"}, {"REPORT_GUARD", "performance"},
+    {"TRACE", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"PASS_CRUMBS", "diagnostics"}, {"ADDR_REPORT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
+    {"WB_FENCE_LIMIT", "diagnostics"}, {"WB_MERGE", "diagnostics"}, {"WB_EXACT", "diagnostics"}, {"WB_EAGER", "diagnostics"},
+    {"MV_SURVEY", "diagnostics"}, {"PLUGIN_TRACE", "diagnostics"},
+    {"GAMEPLAY_TWEAKS_ENABLED", "gameplay tweaks"}, {"GAMEPLAY_ULTRAHAND_ROTATE", "gameplay tweaks"},
+    {"GAMEPLAY_ULTRAHAND_C_AXIS", "gameplay tweaks"}, {"GAMEPLAY_ULTRAHAND_DISTANCE", "gameplay tweaks"},
+    {"GAMEPLAY_ITEM_WHEEL", "gameplay tweaks"}, {"GAMEPLAY_ITEM_AD", "gameplay tweaks"},
+    {"GAMEPLAY_MAP_ZOOM", "gameplay tweaks"}, {"GAMEPLAY_MAP_ZOOM_SENSITIVITY", "gameplay tweaks"},
+    {"GAMEPLAY_ROTATION_SENSITIVITY", "gameplay tweaks"}, {"GAMEPLAY_DISTANCE_SENSITIVITY", "gameplay tweaks"},
+    {"GAMEPLAY_ITEM_SENSITIVITY", "gameplay tweaks"},
+    {"GAMEPLAY_WEAPON_WHEEL", "gameplay tweaks"}, {"GAMEPLAY_WEAPON_SENSITIVITY", "gameplay tweaks"},
+};
+
+// The settings the menu shows: the value in effect when the key is unset, and what the key accepts. The only place a
+// default lives: consumers read cfg_value / cfg_int / cfg_double / cfg_bool. A row with an empty default has no fixed
+// value (it depends on the machine); its consumer reads cfg_get and keeps an "unset" branch.
+#define LIVE 1
+#define RESTART 0
+static const CfgMeta metas[] = {
+    // Screen
+    {"FULLSCREEN", "0", "0|1", LIVE}, {"WINDOW_SIZE", "1920x1080", NULL, LIVE},
+    {"VK_PRESENT", "mailbox", "mailbox|fifo|immediate", LIVE}, {"GPU_INDEX", "", NULL, RESTART},
+    {"PERF_OVERLAY", "off", "off|fps|full", LIVE},
+    {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},
+    {"HUD_WIDTH", "full", "full|21:9|16:9", RESTART},
+    {"DYNAMIC_RES", "1", "0|1", LIVE},   // resolution.c res_dynres_live
+    {"UPSCALER", "fsr", "fsr|bilinear", LIVE}, {"SHARPNESS", "80", "0..100", LIVE},
+    {"SCENE_UPSCALER", "off", "off|dlss|fsr3", RESTART}, {"DLAA", "0", "0|1", RESTART},
+    {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
+    {"FSR_SHARPNESS", "80", "0..100", LIVE},   // vk_dlaa.c fsr_evaluate
+    {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"DLSS_FIXED_EXPOSURE", "0", "0|1", LIVE}, {"DLAA_EFFECTS_AFTER", "0", "0|1", LIVE},
+    {"DLSS_CHAR_MASK", "65", "0|35|65|100", LIVE}, {"REFLEX", "off", "off|on|boost", RESTART}, {"FXAA", "1", "0|1", LIVE},
+    {"LOD_STEADY", "0", "0|1", RESTART},   // sets steady
+    {"ASPECT", "fit", "fit|stretch", LIVE}, {"MOVIE_ASPECT", "keep", "keep|stretch", LIVE}, {"FOV", "100", "70..140", LIVE},
+    {"ANISO", "game", "game|2|4|8|16", RESTART},   // vk_texture.c sampler_features
+    // colour adjustment (vk_color.c); the preset is the menu's, the four values are what the present uses
+    {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", "0", "-30..30", LIVE},
+    {"COLOR_CONTRAST", "100", "70..150", LIVE}, {"COLOR_SATURATION", "100", "50..200", LIVE},
+    {"COLOR_GAMMA", "1", "0.8..1.2", LIVE},
+    // HDR output (vk_hdr.c): on at start (the tonemap shader is swapped as shaders load); the nits apply at once
+    {"HDR", "0", "0|1", RESTART}, {"HDR_PEAK_NITS", "1000", "400..10000", LIVE}, {"HDR_GAME_NITS", "203", "80..500", LIVE},
+    {"HDR_UI_NITS", "203", "80..500", LIVE}, {"HDR_HUE", "70", "0..100", LIVE},
+    {"DEVICE_PROFILE", "auto", "auto|desktop|deck", RESTART},
+    {"SHADOW_RES", "game", "game|256|512|768|1024|1536|2048", RESTART},
+    {"SHADOW_SCALE", "1", "1..4", RESTART},
+    {"SHADOW_RANGE", "100", "50..400", RESTART}, {"GRASS_RANGE", "100", "50..400", RESTART}, {"CONTACT_SHADOWS", "0", "0..100", RESTART},
+    {"PCSS", "0", "0..200", RESTART},
+    // Game
+    {"FPS_LIMIT", "60", "30|40|45|60|90|120|144|display", LIVE}, {"FPS60", "1", "0|1", LIVE}, {"FRAME_QUEUE", "0", "0|1", LIVE},
+    {"FRAME_GEN", "off", "off|fsr3", LIVE},   // the generator; vk_fg.cpp vk_fg_engine maps it
+    {"REALTIME", "1", "0|1", RESTART}, {"CLOTH_REALTIME", "1", "0|1", RESTART},
+    {"MODS_REBUILD", "auto", "auto|off", RESTART},
+    {"MODS_WITHOUT_CODE", "0", "0|1", RESTART},   // 1: a mod is used without the code module it cannot run (mods.c)
+    {"HIGHFPS_FIX", "1", "0|1", RESTART}, {"CLIMB_FIX", "1", "0|1", RESTART}, {"AUDIO_DRAIN_FIX", "1", "0|1", RESTART},
+    {"SHUTTER_FIX", "1", "0|1", RESTART},
+    {"LANG", "", "ja|en-US|fr|de|it|es|zh-CN|ko|nl|pt|ru|zh-TW|en-GB|fr-CA|es-419|zh-Hans|zh-Hant|pt-BR", RESTART},
+    {"OPERATION_MODE", "docked", "docked|handheld", RESTART},
+    {"ASSUME_FOCUS", "1", "0|1", LIVE},   // read on every focus change (ov_system.c)
+    // Sound, Controls, Menu
+    {"VOLUME", "100", "0..100", LIVE}, {"VOLUME_MUSIC", "100", "0..100", LIVE}, {"VOLUME_SFX", "100", "0..100", LIVE}, {"VOLUME_VOICE", "100", "0..100", LIVE}, {"AUDIO_CHANNELS", "stereo", "auto|stereo|5.1", RESTART},
+    {"AUDIO_DEVICE", "", NULL, LIVE},   // audio_mixer.c output_worker: a device name, empty for the system default
+    {"MOTION", "1", "0|1", LIVE}, {"JOYCON_DRIVER", "auto", "auto|hidapi|sdl|off", LIVE}, {"JOYCON_MODE", "auto", "auto|dual|single", LIVE}, {"KBM_MOTION_SENS", "1", "0.1..5", LIVE}, {"KEYS", "", NULL, RESTART}, {"GYRO_CALIBRATION", "1", "0|1", LIVE}, {"GYRO_AUTO_BIAS", "0", "0|1", LIVE},
+    {"RUMBLE_STRENGTH", "130", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
+    // Written by the Calibrate gyro row (motion_fusion.c save_bias), not by hand; read by input.c pad_bias_select when a
+    // controller connects and gyro_bias_pad names it.
+    {"GYRO_BIAS_X", "", NULL, RESTART}, {"GYRO_BIAS_Y", "", NULL, RESTART}, {"GYRO_BIAS_Z", "", NULL, RESTART},
+    {"GYRO_BIAS_PAD", "", NULL, RESTART},
+    {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "auto", "auto|nintendo|xbox", LIVE},
+    {"PROMPTS", "nintendo", "nintendo|xbox|playstation|pc", RESTART},
+    {"STICK_DEADZONE", "8", "0..50", LIVE}, {"STICK_SENS", "1", "0.1..3", RESTART},
+    {"LSTICK_DEADZONE", "", "0..50", LIVE}, {"RSTICK_DEADZONE", "", "0..50", LIVE},
+    {"MOUSE_MODE", "direct", "stick|direct", LIVE},
+    {"MOUSE_SENS", "1", "0..10", LIVE}, {"MOUSE_AIM_SCALE", "1", "0.1..3", LIVE}, {"MENU_CURSOR", "1", "0|1", LIVE},
+    {"MAP_CLICK", "0", "0|1", LIVE},   // input.c: the left mouse button is A on the Purah Pad's map
+    {"DIALOGUE_CLICK", "0", "0|1", LIVE},   // menu_cursor.c: in a dialogue box left click is B, right click A
+    {"POINTER_IMAGE", "0", "0|1", LIVE},    // input_win.c / input_sdl.c: the game window's own pointer (cursor_art.c)
+    {"QUICKSAVE", "0", "0|1", LIVE},        // quicksave.c: one key saves (an autosave), another loads it
+    {"QUICKSAVE_KEY", "f6", NULL, LIVE}, {"QUICKLOAD_KEY", "f7", NULL, LIVE},   // Half-Life's keys; a key name or none
+    {"WALK_KEY", "none", NULL, LIVE}, {"WALK_SCALE", "0.51", "0.2..0.9", LIVE},
+    // freecam.c: the patch set of its hook (off: the game's camera code as shipped), then the combo and key that step it
+    {"FREECAM_PATCH", "0", "0|1", RESTART}, {"FREECAM_PAD", "none", NULL, LIVE}, {"FREECAM_KEY", "none", NULL, LIVE},
+    // Gameplay Tweaks
+    {"GAMEPLAY_TWEAKS_ENABLED", "0", "0|1", LIVE},
+    {"GAMEPLAY_ULTRAHAND_ROTATE", "1", "0|1", LIVE}, {"GAMEPLAY_ULTRAHAND_C_AXIS", "1", "0|1", LIVE},
+    {"GAMEPLAY_ULTRAHAND_DISTANCE", "1", "0|1", LIVE}, {"GAMEPLAY_ITEM_WHEEL", "1", "0|1", LIVE},
+    {"GAMEPLAY_ITEM_AD", "1", "0|1", LIVE}, {"GAMEPLAY_MAP_ZOOM", "1", "0|1", LIVE},
+    {"GAMEPLAY_MAP_ZOOM_SENSITIVITY", "1", "0.25..4", LIVE}, {"GAMEPLAY_ROTATION_SENSITIVITY", "1", "0.25..4", LIVE},
+    {"GAMEPLAY_DISTANCE_SENSITIVITY", "1", "0.25..4", LIVE}, {"GAMEPLAY_ITEM_SENSITIVITY", "1", "0.25..4", LIVE},
+    {"GAMEPLAY_WEAPON_WHEEL", "1", "0|1", LIVE}, {"GAMEPLAY_WEAPON_SENSITIVITY", "1", "0.25..4", LIVE},
+    {"MENU_LANG", "", "en|ru|pt-BR|zh-Hans", LIVE},
+    // plat_font_path on Linux: 1 asks fontconfig which file draws the language, 0 keeps the fixed distribution
+    // paths. A rebuild of the atlas reads it, so a change shows on the next window size or language switch.
+    {"MENU_FONT_FONTCONFIG", "1", "0|1", LIVE},
+    {"AMIIBO_DIR", "", NULL, LIVE},
+    // Discord Rich Presence (discord_rpc.c): off by default, the Menu tab of the settings menu switches it.
+    {"DISCORD_RPC", "0", "0|1", LIVE},
+    {"DISCORD_APP_ID", "1567232599846293504", NULL, LIVE},
+    {"DISCORD_IMAGE", "totk_512x512", NULL, LIVE},
+    // Advanced: scheduling
+    {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
+    {"REPLAY_WORKERS", "0", "0..16", RESTART}, {"REPLAY_CHUNKS", "0", "0..64", RESTART},
+    {"REPLAY_CHUNK_DRAWS", "128", "1..100000", RESTART}, {"REPLAY_STATE_CHECK", "0", "0|1", RESTART},
+    {"REPLAY_SKEW_US", "0", "0..100000", RESTART},
+    {"SYNC_AHEAD", "0", "0|1|check", RESTART}, {"SHADOW_DEFER", "1", "0|1", RESTART},
+    {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
+    // shaders and pipelines
+    {"PIPE_WAIT", "default", "default|draw", RESTART}, {"PIPE_SKIP", "fullscreen", "strict|any|fullscreen", RESTART},
+    {"BARRIER_MERGE", "0", "0|1", RESTART}, {"LIB_PREBUILD", "1", "0|1", RESTART}, {"LIB_PREBUILD_THREADS", "", "1..64", RESTART},
+    {"PIPE_PREBUILD", "1", "0|1", RESTART}, {"PREWARM_XLATE", "", "1..64", RESTART}, {"GPL", "1", "0|1", RESTART},
+    // textures and memory
+    {"ASTC", "auto", "auto|gpu|native|cpu", RESTART}, {"MEMORY", "auto", "auto|import|mirror|verify", RESTART},
+    {"TEX_ALIAS", "1", "0|1", RESTART}, {"TEX_VRAM_PRESSURE", "90", "0..100", RESTART},
+    {"TEX_RELEASED_MIB", "256", "0..65536", RESTART}, {"TEX_BLOCK_MIB", "64", "0..1024", RESTART}, {"VMA_BLOCK_MIB", "64", "0..1024", RESTART}, {"ASTC_BC", "", "0|1", RESTART}, {"ZSTD_NATIVE", "1", "0|1", RESTART}, {"ZSTD_CHECK", "0", "0|1", RESTART},
+    // crash guards: code patch sets (recomp/patches-v*.txt) over game reads that crash on stale data
+    {"OPTREF_GUARD", "1", "0|1", RESTART}, {"ABILITY_GUARD", "1", "0|1", RESTART}, {"REPORT_GUARD", "1", "0|1", RESTART},
+    // render fixes
+    {"LOD_GUARD", "1", "0|1", RESTART}, {"FIX_C0", "1", "0|1", RESTART}, {"FIX_ZERO", "1", "0|1", RESTART},
+    {"BIND_SKIP", "1", "0|1", RESTART}, {"SHADER_MEMO", "1", "0|1", RESTART}, {"PIPE_MEMO", "1", "0|1", RESTART}, {"MEMX", "1", "0|1|check", RESTART}, {"BIND_INC", "0", "0|1|check", RESTART}, {"TEX_MEMO", "1", "0|1", RESTART},
+    {"VB_USED", "1", "0|1", RESTART},
+    {"DESC_TEMPLATE", "1", "0|1", RESTART},
+    {"PUSH_SKIP", "1", "0|1", RESTART}, {"SPLIT_DRAWS", "64", "0..1000", RESTART},
+    {"SPLIT_US", "1000", "0..20000", RESTART},
+    // Vulkan
+    {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART},
+    {"VK_DYN_A2C", "", "0|1", RESTART}, {"VK_SUBGROUP_PIN", "1", "0|1", RESTART},
+    // diagnostics
+    {"TRACE", "", NULL, RESTART}, {"FLIGHT", "0", "0|1", RESTART}, {"FLIGHT_SPIKE_MS", "100", "0..60000", RESTART},
+    {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_MERGE", "1", "0|1", RESTART}, {"WB_EXACT", "1", "0|1", RESTART},
+    {"WB_EAGER", "1", "0|1|check", RESTART},   // vk_texture.c: part of sync_ahead; 0 and check for comparing
+    {"PASS_CRUMBS", "", "0|1", RESTART},   // vk_crumbs.c pass marks; unset: VK_AMD_buffer_marker only
+    {"ADDR_REPORT", "0", "0|1", RESTART},   // vk_device.c GPU address map for device faults
+    {"PLUGIN_TRACE", "0", "0|1", RESTART},   // plugin_init.c: the first call of each mod plugin hook entry
+    {"INPUT_RECORD", "", NULL, RESTART},
+};
+
+static int is_known(const char *key) {
+    for (size_t i = 0; i < sizeof known / sizeof *known; i++)
+        if (!strcmp(known[i], key)) return 1;
+    return !strncmp(key, "CHEAT_", 6);   // cheats.c and the cheat patch sets (tools/cheats.py)
+}
+
+static void clear(void) {
+    for (int i = 0; i < n_entries; i++) free(entries[i].key), free(entries[i].value);
+    n_entries = 0;
+}
+
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) *--e = 0;
+    return s;
+}
+
+static const char *strip_prefix(const char *key) {
+    if (!strncmp(key, PREFIX, PREFIX_LEN)) return key + PREFIX_LEN;
+    if (!strncmp(key, NSS_PREFIX, NSS_PREFIX_LEN)) return key + NSS_PREFIX_LEN;
+    return NULL;
+}
+
+static const char *env_for_stripped(const char *k) {
+    char var[128];
+    snprintf(var, sizeof var, NSS_PREFIX "%s", k);
+    const char *e = getenv(var);
+    if (e) return e;
+    snprintf(var, sizeof var, PREFIX "%s", k);
+    return getenv(var);
+}
+
+// The upper-case key without the prefix, in place.
+static char *norm_key(char *key) {
+    for (char *p = key; *p; p++) *p = (char)toupper((unsigned char)*p);
+    if (!strncmp(key, PREFIX, PREFIX_LEN)) return key + PREFIX_LEN;
+    if (!strncmp(key, NSS_PREFIX, NSS_PREFIX_LEN)) return key + NSS_PREFIX_LEN;
+    return key;
+}
+
+static void add(char *key, char *value, int line) {
+    key = norm_key(key);
+    size_t vl = strlen(value);
+    if (vl >= 2 && value[0] == '"' && value[vl - 1] == '"') value[vl - 1] = 0, value++;
+    if (!*key) return;
+    if (!is_known(key)) rt_log("cfg: totk.ini line %d: unknown key '%s'", line, key);
+    if (!*value) return;   // "key =" leaves the setting at its default
+    for (int i = 0; i < n_entries; i++)
+        if (!strcmp(entries[i].key, key)) {   // a repeated key: the later line wins
+            free(entries[i].value);
+            entries[i].value = strdup(value);
+            return;
+        }
+    if (n_entries == CFG_MAX_KEYS) return;
+    entries[n_entries++] = (CfgEntry){strdup(key), strdup(value), 0, 0};
+}
+
+// 0.1.9 had the Xbox prompts as a pad layout: pad_layout = xbox_prompts is pad_layout = nintendo with prompts = xbox.
+// Read as those two, which the menu shows and the next cfg_save writes; a prompts line of the file's own wins. The
+// value still works from the environment (input_pad_layout_pick, input_prompts_pick).
+static void migrate(void) {
+    CfgEntry *layout = NULL, *prompts = NULL;
+    for (int i = 0; i < n_entries; i++) {
+        if (!strcmp(entries[i].key, "PAD_LAYOUT")) layout = &entries[i];
+        if (!strcmp(entries[i].key, "PROMPTS")) prompts = &entries[i];
+    }
+    if (!layout || strcasecmp(layout->value, "xbox_prompts")) return;
+    free(layout->value);
+    layout->value = strdup("nintendo");
+    layout->dirty = 1;
+    if (!prompts && n_entries < CFG_MAX_KEYS) entries[n_entries++] = (CfgEntry){strdup("PROMPTS"), strdup("xbox"), 1, 0};
+    rt_log("cfg: totk.ini pad_layout = xbox_prompts is read as pad_layout = nintendo and prompts = %s",
+           prompts ? prompts->value : "xbox");
+}
+
+int cfg_load(const char *path) {
+    clear();
+    uint64_t size = 0;
+    uint8_t *data = plat_file_read(path, &size);
+    if (!data) return 0;
+    char *p = (char *)data;
+    if (size >= 3 && !memcmp(p, "\xEF\xBB\xBF", 3)) p += 3;   // editors add a BOM
+    for (int line = 1; *p; line++) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol = 0;
+        char *s = trim(p);
+        char *eq = strchr(s, '=');
+        if (*s && *s != '#' && *s != ';' && *s != '[') {
+            if (!eq) rt_log("cfg: totk.ini line %d: no '=' in '%s'", line, s);
+            else {
+                *eq = 0;
+                add(trim(s), trim(eq + 1), line);
+            }
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    free(data);
+    migrate();
+    return 1;
+}
+
+// ---- device profiles: defaults for a known machine, below the environment and totk.ini and above the table, so any
+// key the player sets wins and resetting a key in the menu returns to the profile's value. TOTK_DEVICE_PROFILE = auto
+// (default: the Steam Deck when the firmware says so), desktop (none) or deck.
+//
+// The Steam Deck (LCD Jupiter, OLED Galileo; 1280x800, 16:10, 4 Zen 2 cores, RDNA 2 with 8 CUs sharing 16 GB): the game
+// at the screen's 1280x800 with its own 5/6 scene (the aspect patch gives the camera its 16:10, resolution.c, and the
+// romfs-patches-1280x800 overlay the HUD's);
+// fullscreen and vsync, as gamescope composes Game Mode; 40 fps, which divides 40 Hz (and 120 Hz on the OLED).
+// Starting points to replace with measured ones (docs/tester-guide.md, Steam Deck).
+static const struct { const char *key, *value; } DECK[] = {
+    {"FULLSCREEN", "1"}, {"WINDOW_SIZE", "1280x800"}, {"OUTPUT_RES", "1280x800"}, {"RENDER_SCALE", "game"},
+    {"VK_PRESENT", "fifo"}, {"FPS_LIMIT", "40"},
+};
+static int profile = -1;   // 0 none, 1 Steam Deck
+
+static int read_line(const char *path, char *out, size_t n) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int ok = fgets(out, (int)n, f) != NULL;
+    fclose(f);
+    out[ok ? strcspn(out, "\r\n") : 0] = 0;
+    return ok;
+}
+
+// The Steam Deck: Valve's board, product Jupiter or Galileo (/sys/class/dmi/id); SteamDeck=1, which Steam sets on it.
+static int on_steam_deck(void) {
+    const char *env = getenv("SteamDeck");
+    if (env && !strcmp(env, "1")) return 1;
+    char vendor[64], product[64];
+    return read_line("/sys/class/dmi/id/board_vendor", vendor, sizeof vendor) && !strcmp(vendor, "Valve") &&
+           read_line("/sys/class/dmi/id/product_name", product, sizeof product) &&
+           (!strcmp(product, "Jupiter") || !strcmp(product, "Galileo"));
+}
+
+static const char *raw_get(const char *name);
+
+static int profile_of(void) {
+    int p = __atomic_load_n(&profile, __ATOMIC_ACQUIRE);
+    if (p >= 0) return p;
+    const char *set = raw_get(PREFIX "DEVICE_PROFILE");
+    if (set && !strcmp(set, "deck")) p = 1;
+    else if (set && *set && strcmp(set, "auto")) p = 0;
+    else p = on_steam_deck();
+    __atomic_store_n(&profile, p, __ATOMIC_RELEASE);
+    return p;
+}
+
+const char *cfg_device_profile(void) { return profile_of() ? "deck" : "desktop"; }
+
+static const char *raw_get(const char *name) {
+    const char *k = strip_prefix(name);
+    const char *e = k ? env_for_stripped(k) : getenv(name);
+    if (e || !k) return e;
+    int n = __atomic_load_n(&n_entries, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++)
+        if (!strcasecmp(entries[i].key, k)) return __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
+    return NULL;
+}
+
+// ---- the screen's shape (desktop): a primary display of another shape than 16:9 gives output_res a default of that
+// shape while neither the environment nor totk.ini sets it, so the first start fills the screen instead of a 16:9
+// picture between black bars. The sizes are the ones the installer lays the HUD out for (installer/steps.py
+// ASPECT_SIZES, ui/menu.cpp row_output_res): of the display's shape within 1%, the smallest at least 1080 high that fits
+// the display, else the largest that fits. A 16:9 display, an unknown one or one of another shape keeps 1920x1080.
+// Xbox, PlayStation and keyboard prompts need their folder for that size's shape too (romfs-patches-<style>-<w>x<h>,
+// written by installer/steps.py Shapes for the style totk.ini selects and the connected displays' shapes): they
+// keep 1920x1080 when it is missing, as in a source build without make_romfs_patches.py --prompts <style> --aspect or
+// after a switch of prompts in the menu, where a default of another shape would trade the prompts the player chose for
+// the Switch ones.
+static const unsigned SHAPED[][2] = {
+    {2560, 1080}, {3440, 1440}, {3840, 1600}, {5120, 2160},             // 21:9
+    {3840, 1080}, {5120, 1440},                                         // 32:9
+    {1280, 800}, {1680, 1050}, {1920, 1200}, {2560, 1600},              // 16:10
+    {1920, 1280}, {2160, 1440}, {2256, 1504}, {2880, 1920}, {3000, 2000}, // 3:2
+};
+
+// The folder size of w x h's shape: of SHAPED within 1% of its aspect ratio, the closest, the first of equal ones
+// (5120x2160 takes 2560x1080). The UI layout depends on the aspect ratio alone (tools/ultrawide_layout.py apply), so
+// the setup writes one romfs-patches-<w>x<h> per shape, named after this size (installer/screens.py shape_size, the
+// same rule), and romfs.c overlay_init looks for it. 0 for 16:9 and for a shape without a layout.
+int cfg_shape_size(unsigned w, unsigned h, unsigned out[2]) {
+    if (!w || !h) return 0;
+    double r = (double)w / h, err = 0;
+    if (fabs(r / (16.0 / 9.0) - 1) <= 0.01) return 0;
+    int best = -1;
+    for (int i = 0; i < (int)(sizeof SHAPED / sizeof *SHAPED); i++) {
+        double e = fabs((double)SHAPED[i][0] / SHAPED[i][1] / r - 1);
+        if (e <= 0.01 && (best < 0 || e < err)) best = i, err = e;
+    }
+    if (best < 0) return 0;
+    out[0] = SHAPED[best][0], out[1] = SHAPED[best][1];
+    return 1;
+}
+
+static char screen_res[16];   // set once by cfg_init, "" for none
+// Which pad and keyboard prompts' folders have a manifest at screen_res's shape (<folder>-<screen_res>; set once by
+// cfg_init): the folders input_map.c input_prompts_folder names
+static const char *const screen_folders[5] = {"romfs-patches-xbox", "romfs-patches-xbox-label",
+                                              "romfs-patches-playstation", "romfs-patches-playstation-xbox",
+                                              "romfs-patches-pc"};
+static int screen_prompts[5];
+
+// Whether the prompts in effect have their folder at screen_res: the folder input_map.c input_prompts_pick and
+// input_prompts_folder pick at start. The game's own prompts need none.
+static int shape_keeps_prompts(void) {
+    const char *layout = raw_get(PREFIX "PAD_LAYOUT");
+    const char *want = input_prompts_folder(input_prompts_pick(raw_get(PREFIX "PROMPTS"), layout), layout);
+    for (int i = 0; want && i < 5; i++)
+        if (!strcmp(screen_folders[i], want)) return screen_prompts[i];
+    return 1;
+}
+
+static void screen_default(void) {
+    int sw, sh;
+    if (!plat_screen_size(&sw, &sh)) return;
+    double r = (double)sw / sh;
+    if (fabs(r / (16.0 / 9.0) - 1) <= 0.01) return;
+    int best = -1, fit = -1;
+    for (int i = 0; i < (int)(sizeof SHAPED / sizeof *SHAPED); i++) {
+        unsigned w = SHAPED[i][0], h = SHAPED[i][1];
+        if (fabs((double)w / h / r - 1) > 0.01 || w > (unsigned)sw || h > (unsigned)sh) continue;
+        if (fit < 0 || w > SHAPED[fit][0]) fit = i;   // the largest that fits
+        if (h >= 1080 && (best < 0 || w < SHAPED[best][0])) best = i;
+    }
+    if (best < 0) best = fit;
+    if (best < 0) return;
+    snprintf(screen_res, sizeof screen_res, "%ux%u", SHAPED[best][0], SHAPED[best][1]);
+    for (int i = 0; i < 5; i++)
+        screen_prompts[i] = romfs_shaped_prompts_ready(screen_folders[i], SHAPED[best][0], SHAPED[best][1]);
+    if (!raw_get(PREFIX "OUTPUT_RES") && shape_keeps_prompts())
+        rt_log("cfg: the display is %dx%d: output_res defaults to %s, its shape (totk.ini output_res sets another)", sw,
+               sh, screen_res);
+}
+
+int cfg_screen_size(unsigned out[2]) {
+    unsigned w = 0, h = 0;
+    if (raw_get(PREFIX "OUTPUT_RES") || !screen_res[0] || sscanf(screen_res, "%ux%u", &w, &h) != 2) return 0;
+    out[0] = w, out[1] = h;
+    return 1;
+}
+
+const char *cfg_get(const char *name) {
+    const char *v = raw_get(name);
+    const char *k = strip_prefix(name);
+    if (v || !k) return v;
+    if (!profile_of())
+        return screen_res[0] && !strcasecmp(k, "OUTPUT_RES") && shape_keeps_prompts() ? screen_res : NULL;
+    for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
+        if (!strcasecmp(DECK[i].key, k)) return DECK[i].value;
+    return NULL;
+}
+
+// Whether name's value comes from the player (the environment or nssports.ini), not a profile or the table.
+int cfg_is_set(const char *name) { return raw_get(name) != NULL; }
+
+unsigned cfg_version(void) { return __atomic_load_n(&version, __ATOMIC_ACQUIRE); }
+
+int cfg_from_env(const char *name) {
+    const char *k = strip_prefix(name);
+    return (k ? env_for_stripped(k) : getenv(name)) != NULL;
+}
+
+void cfg_set(const char *name, const char *value) {
+    const char *k = strip_prefix(name);
+    if (!k || !value) return;
+    char key[64];
+    snprintf(key, sizeof key, "%s", k);
+    for (char *p = key; *p; p++) *p = (char)toupper((unsigned char)*p);
+    plat_mutex_lock(&set_lock);
+    int i = 0, n = n_entries;
+    while (i < n && strcmp(entries[i].key, key)) i++;
+    if (i < n) {
+        if (!entries[i].value || strcmp(entries[i].value, value)) {
+            __atomic_store_n(&entries[i].value, strdup(value), __ATOMIC_RELEASE);   // the old string stays for readers
+            entries[i].dirty = 1;
+        }
+        entries[i].removed = 0;   // a value set after cfg_reset replaces the line instead of deleting it
+    } else if (n < CFG_MAX_KEYS) {
+        entries[n] = (CfgEntry){strdup(key), strdup(value), 1, 0};
+        __atomic_store_n(&n_entries, n + 1, __ATOMIC_RELEASE);
+    }
+    __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&set_lock);
+}
+
+int cfg_reset(const char *const *keys, int n) {
+    int done = 0;
+    plat_mutex_lock(&set_lock);
+    for (int k = 0; k < n; k++) {
+        char key[64];
+        snprintf(key, sizeof key, "%s", keys[k]);
+        const char *name = norm_key(key);
+        if (env_for_stripped(name)) continue;   // the environment wins; the file line stays
+        int i = 0;
+        while (i < n_entries && strcmp(entries[i].key, name)) i++;
+        if (i == n_entries) {   // no value in memory ("key =" in the file): the line still has to go
+            if (i == CFG_MAX_KEYS) continue;
+            entries[i] = (CfgEntry){strdup(name), NULL, 0, 1};
+            __atomic_store_n(&n_entries, i + 1, __ATOMIC_RELEASE);
+        } else if (entries[i].value) {
+            __atomic_store_n(&entries[i].value, NULL, __ATOMIC_RELEASE);   // the old string stays for readers
+            entries[i].dirty = 0;
+            entries[i].removed = 1;   // cfg_save_to deletes the key's lines
+            done++;
+        } else {
+            entries[i].removed = 1;
+        }
+    }
+    if (done) __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
+    plat_mutex_unlock(&set_lock);
+    return done;
+}
+
+int cfg_last_save_ok(void) { return __atomic_load_n(&save_ok, __ATOMIC_ACQUIRE); }
+
+void cfg_each_active(void (*cb)(const char *key, const char *value, int from_env, void *ctx), void *ctx) {
+    int n = __atomic_load_n(&n_entries, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        const char *v = __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
+        if (v) cb(entries[i].key, v, 0, ctx);
+    }
+    for (size_t i = 0; i < sizeof known / sizeof *known; i++) {
+        const char *e = env_for_stripped(known[i]);
+        if (e) cb(known[i], e, 1, ctx);
+    }
+}
+
+const CfgMeta *cfg_meta(const char *key) {
+    char k[64];
+    snprintf(k, sizeof k, "%s", key);
+    const char *name = norm_key(k);
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++)
+        if (!strcmp(metas[i].key, name)) return &metas[i];
+    return NULL;
+}
+
+const CfgMeta *cfg_meta_at(int i) { return i >= 0 && (size_t)i < sizeof metas / sizeof *metas ? &metas[i] : NULL; }
+
+const char *cfg_value(const char *name) {
+    const char *e = cfg_get(name);
+    if (e && *e) return e;
+    const CfgMeta *m = cfg_meta(name);
+    if (!m) rt_fatal("cfg: %s has no row in the settings table", name);
+    return m->def;
+}
+
+// The row's default as a number, for a set value that does not parse.
+static double default_number(const char *name) {
+    return strtod(cfg_meta(name)->def, NULL);
+}
+
+double cfg_double(const char *name) {
+    const char *v = cfg_value(name);
+    char *end;
+    double d = strtod(v, &end);
+    return end == v || *end || d != d ? default_number(name) : d;
+}
+
+int cfg_int(const char *name) {
+    const char *v = cfg_value(name);
+    char *end;
+    long l = strtol(v, &end, 10);
+    return end == v || *end ? (int)default_number(name) : (int)l;
+}
+
+int cfg_bool(const char *name) { return strcmp(cfg_value(name), "0") != 0; }
+
+// ---- cfg_save: the file as lines, each with its line ending
+typedef struct { const char *s; size_t n; } Line;   // n includes the '\n' (and '\r') when present
+
+static int line_count(const char *p, size_t size) {
+    int n = 0;
+    for (size_t i = 0; i < size; i++) n += p[i] == '\n';
+    return n + 1;
+}
+
+// The line's text without its ending, BOM and surrounding blanks, into out.
+static void line_text(const Line *l, int first, char *out, size_t cap) {
+    size_t n = l->n;
+    const char *s = l->s;
+    if (first && n >= 3 && !memcmp(s, "\xEF\xBB\xBF", 3)) s += 3, n -= 3;
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, s, n);
+    out[n] = 0;
+    char *t = trim(out);
+    memmove(out, t, strlen(t) + 1);
+}
+
+// The key of a "key = value" line (comment = 0) or of a commented "# key = value" line (comment = 1), normalised,
+// into key; 0 when the line is not one.
+static int line_key(const char *text, int comment, char *key, size_t cap) {
+    if (comment) {
+        if (*text != '#' && *text != ';') return 0;
+        text++;
+        while (*text == ' ' || *text == '\t') text++;
+    }
+    if (!*text || *text == '#' || *text == ';' || *text == '[') return 0;
+    const char *eq = strchr(text, '=');
+    if (!eq) return 0;
+    size_t n = (size_t)(eq - text);
+    while (n && (text[n - 1] == ' ' || text[n - 1] == '\t')) n--;
+    if (!n || n >= cap) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)text[i]) && text[i] != '_') return 0;
+    char tmp[128];
+    memcpy(tmp, text, n);
+    tmp[n] = 0;
+    snprintf(key, cap, "%s", norm_key(tmp));
+    return 1;
+}
+
+// The section name of a "[name]" line, lower-case, into out; 0 when the line is not one.
+static int line_section(const char *text, char *out, size_t cap) {
+    if (*text != '[') return 0;
+    const char *e = strchr(text, ']');
+    if (!e) return 0;
+    char tmp[128];
+    size_t n = (size_t)(e - text - 1);
+    if (n >= sizeof tmp) n = sizeof tmp - 1;
+    memcpy(tmp, text + 1, n);
+    tmp[n] = 0;
+    snprintf(out, cap, "%s", trim(tmp));
+    for (char *p = out; *p; p++) *p = (char)tolower((unsigned char)*p);
+    return 1;
+}
+
+typedef struct { char *buf; size_t n, cap; } Out;
+static void put(Out *o, const char *s, size_t n) {
+    if (o->n + n + 1 > o->cap) {
+        o->cap = (o->n + n + 1) * 2;
+        o->buf = realloc(o->buf, o->cap);
+        if (!o->buf) rt_fatal("cfg: out of memory writing totk.ini");
+    }
+    memcpy(o->buf + o->n, s, n);
+    o->n += n;
+}
+static void puts_(Out *o, const char *s) { put(o, s, strlen(s)); }
+
+static const char *section_of(const char *key) {
+    for (size_t i = 0; i < sizeof sections / sizeof *sections; i++)
+        if (!strcmp(sections[i].key, key)) return sections[i].section;
+    if (!strncmp(key, "CHEAT_", 6)) return "cheats";   // cheats.c: one key per cheat of the cheat file
+    return NULL;
+}
+
+// "key = value" + eol for entry e (key lower-case)
+static void put_entry(Out *o, const CfgEntry *e, const char *eol) {
+    char k[64];
+    snprintf(k, sizeof k, "%s", e->key);
+    for (char *p = k; *p; p++) *p = (char)tolower((unsigned char)*p);
+    puts_(o, k);
+    puts_(o, " = ");
+    puts_(o, e->value);
+    puts_(o, eol);
+}
+
+int cfg_save_to(const char *path) {
+    plat_mutex_lock(&set_lock);
+    int n = n_entries, any = 0;
+    for (int i = 0; i < n; i++) any |= entries[i].dirty | entries[i].removed;
+    if (!any) {
+        __atomic_store_n(&save_ok, 1, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&set_lock);
+        return 1;
+    }
+    uint64_t size = 0;
+    uint8_t *data = plat_file_read(path, &size);
+    if (!data && plat_file_exists(path) && plat_file_size(path) != 0) {
+        // the file is there but unreadable (locked, transient error): rebuilding it from nothing would lose its lines
+        rt_log("cfg: cannot read %s, nothing written", path);
+        __atomic_store_n(&save_ok, 0, __ATOMIC_RELEASE);
+        plat_mutex_unlock(&set_lock);
+        return 0;
+    }
+    const char *text = data ? (const char *)data : "";
+    int nl = data ? line_count(text, size) : 0;
+    Line *lines = calloc((size_t)nl + 1, sizeof *lines);
+    // after[i]: entries to write after line i (-1 = none); replace[i]: the entry whose value line i now carries
+    int *replace = malloc(sizeof(int) * ((size_t)nl + 1)), *after_key = malloc(sizeof(int) * (size_t)(n + 1));
+    char *drop = calloc((size_t)nl + 1, 1);   // lines of a reset key
+    if (!lines || !replace || !after_key || !drop) rt_fatal("cfg: out of memory writing totk.ini");
+    for (int i = 0, at = 0; i < nl; i++) {
+        size_t start = (size_t)at;
+        while ((uint64_t)at < size && text[at] != '\n') at++;
+        if ((uint64_t)at < size) at++;
+        lines[i] = (Line){text + start, (size_t)at - start};
+        replace[i] = -1;
+    }
+    if (nl && !lines[nl - 1].n) nl--;   // the text ended with a newline: no last empty line
+    const char *eol = data && strstr(text, "\r\n") ? "\r\n" : "\n";
+    char t[1024], k[128], sec[128];
+    for (int e = 0; e < n; e++) {
+        after_key[e] = -2;   // -2 clean, -1 append in a new section at the end, >= 0 insert after that line
+        if (entries[e].removed)
+            for (int i = 0; i < nl; i++) {
+                line_text(&lines[i], i == 0, t, sizeof t);
+                if (line_key(t, 0, k, sizeof k) && !strcmp(k, entries[e].key)) drop[i] = 1;
+            }
+        if (!entries[e].dirty) continue;
+        int last = -1;
+        for (int i = 0; i < nl; i++) {
+            line_text(&lines[i], i == 0, t, sizeof t);
+            if (line_key(t, 0, k, sizeof k) && !strcmp(k, entries[e].key)) last = i;
+        }
+        if (last >= 0) {
+            replace[last] = e;
+            continue;
+        }
+        const char *want = section_of(entries[e].key);
+        int in = 0, example = -1, tail = -1;
+        for (int i = 0; i < nl && want; i++) {
+            line_text(&lines[i], i == 0, t, sizeof t);
+            if (line_section(t, sec, sizeof sec)) {
+                in = !strcmp(sec, want);
+                if (in) tail = i;
+                continue;
+            }
+            if (!in) continue;
+            if (*t) tail = i;
+            if (line_key(t, 1, k, sizeof k) && !strcmp(k, entries[e].key)) example = i;
+        }
+        after_key[e] = example >= 0 ? example : tail;
+    }
+    Out o = {0};
+    for (int i = 0; i < nl; i++) {
+        if (drop[i]) {
+            // the line leaves the file; keys inserted after it still need a line ending before them
+        } else if (replace[i] >= 0) {
+            // keep the line's indentation and key spelling, put the new value after " = "
+            const char *s = lines[i].s;
+            size_t len = lines[i].n;
+            if (i == 0 && len >= 3 && !memcmp(s, "\xEF\xBB\xBF", 3)) put(&o, s, 3), s += 3, len -= 3;
+            const char *eq = memchr(s, '=', len);
+            size_t kn = (size_t)(eq - s);
+            while (kn && (s[kn - 1] == ' ' || s[kn - 1] == '\t')) kn--;
+            put(&o, s, kn);
+            puts_(&o, " = ");
+            puts_(&o, entries[replace[i]].value);
+            int had_eol = len && s[len - 1] == '\n';
+            if (had_eol) puts_(&o, eol);
+        } else {
+            put(&o, lines[i].s, lines[i].n);
+        }
+        for (int e = 0; e < n; e++)
+            if (after_key[e] == i) {
+                if (o.n && o.buf[o.n - 1] != '\n') puts_(&o, eol);
+                put_entry(&o, &entries[e], eol);
+            }
+    }
+    // keys whose section the file lacks: one new section each, at the end
+    for (int e = 0; e < n; e++) {
+        if (after_key[e] != -1) continue;
+        const char *want = section_of(entries[e].key);
+        if (o.n && o.buf[o.n - 1] != '\n') puts_(&o, eol);
+        if (want) {
+            if (o.n) puts_(&o, eol);
+            puts_(&o, "[");
+            puts_(&o, want);
+            puts_(&o, "]");
+            puts_(&o, eol);
+        }
+        put_entry(&o, &entries[e], eol);
+        // the following keys of the same new section go right after this one
+        for (int f = e + 1; f < n && want; f++)
+            if (after_key[f] == -1 && section_of(entries[f].key) && !strcmp(section_of(entries[f].key), want)) {
+                put_entry(&o, &entries[f], eol);
+                after_key[f] = -3;
+            }
+    }
+    int ok = plat_file_write_atomic(path, o.buf ? o.buf : "", o.n);
+    if (ok)
+        for (int e = 0; e < n; e++) entries[e].dirty = entries[e].removed = 0;
+    else
+        rt_log("cfg: cannot write %s", path);
+    __atomic_store_n(&save_ok, ok ? 1 : 0, __ATOMIC_RELEASE);
+    free(o.buf);
+    free(drop);
+    free(after_key);
+    free(replace);
+    free(lines);
+    free(data);
+    plat_mutex_unlock(&set_lock);
+    return ok;
+}
+
+static char ini_path[1024];
+
+static int find_ini(void) {
+    if (ini_path[0]) return 1;
+    char path[1024];
+    if (!plat_exe_path(path, sizeof path)) return 0;
+    char *cut = plat_last_sep(path);
+    if (!cut) cut = strrchr(path, '/');
+    if (!cut || cut + 16 >= path + sizeof path) return 0;
+    strcpy(cut + 1, "nssports.ini");
+    snprintf(ini_path, sizeof ini_path, "%s", path);
+    return 1;
+}
+
+int cfg_save(void) {
+    if (find_ini()) return cfg_save_to(ini_path);
+    __atomic_store_n(&save_ok, 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static void load_ini(void) {
+    if (!find_ini()) return;
+    char load_path[1024];
+    snprintf(load_path, sizeof load_path, "%s", ini_path);
+    if (!plat_file_exists(load_path)) {
+        char fallback[1024];
+        snprintf(fallback, sizeof fallback, "%s", ini_path);
+        char *cut = plat_last_sep(fallback);
+        if (!cut) cut = strrchr(fallback, '/');
+        if (cut && cut + 10 < fallback + sizeof fallback) {
+            strcpy(cut + 1, "totk.ini");
+            if (plat_file_exists(fallback)) snprintf(load_path, sizeof load_path, "%s", fallback);
+        }
+    }
+    if (!cfg_load(load_path)) {
+        rt_log("cfg: no settings file at %s", ini_path);
+        return;
+    }
+    rt_log("cfg: read %s: %d keys", load_path, n_entries);
+    for (int i = 0; i < n_entries; i++) {
+        if (env_for_stripped(entries[i].key))
+            rt_log("cfg: %s (NSS_/TOTK_) is set in the environment and overrides %s", entries[i].key, load_path);
+    }
+}
+
+void cfg_init(void) {
+    load_ini();
+    if (!profile_of()) screen_default();
+    if (profile_of())
+        rt_log("cfg: device profile Steam Deck: defaults for the keys totk.ini does not set (TOTK_DEVICE_PROFILE=desktop "
+               "turns it off)");
+}
+
+// scene_upscaler, or for a totk.ini that predates it the dlaa switch it replaced: dlaa = 1 is DLSS, anything else off.
+// FSR 3.1 is never the answer for a player who did not pick it. An unknown value is off.
+const char *cfg_scene_upscaler(void) {
+    if (!cfg_is_set("TOTK_SCENE_UPSCALER")) return cfg_bool("TOTK_DLAA") ? "dlss" : "off";
+    const char *v = cfg_value("TOTK_SCENE_UPSCALER");
+    return !strcmp(v, "dlss") ? "dlss" : !strcmp(v, "fsr3") ? "fsr3" : "off";
+}

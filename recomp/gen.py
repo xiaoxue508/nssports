@@ -1,0 +1,1160 @@
+# Adapted from LAS Recomp tools/gen.py @ da35b83 (MIT, Copyright (c) 2026 Peiikai).
+"""Generate C for the ExeFS modules: function discovery, then parallel emission into chunked C files.
+
+Usage: gen.py --exefs build/extracted/v0/exefs --out generated/v0 [--modules main,subsdk0,sdk] [--jobs N]
+              [--limit N] [--chunk-fns N] [--chunk-bytes B] [--big-fn B] [--patches FILE] [--v-locals K [--v-trust]]
+              [--no-cache] [--fn-enter-all] [--plugins NSO[,NSO...]]
+
+--plugins places a mod's code modules (exlaunch plugins) after sdk as plugin0..N (recomp/layout.py) and lifts them with
+the game modules; their DT_INIT and init_array entries are seeds too (Module.init_functions). Without it the output is
+what it was before plugins existed.
+
+Output, under --out:
+  layout.h, layout.json        module bases (recomp/layout.py)
+  <mod>/<mod>_NNNN.c           one `void f_<addr>(Cpu *c)` per guest function, about --chunk-bytes of C per file
+  <mod>/<mod>_table.c          sorted <mod>_fn_addrs[] / <mod>_fn_ptrs[] / <mod>_fn_count for rt_dispatch
+  <mod>/manifest.json          chunk list, function count, statistics and timings
+  <mod>/lift_cache.json        per chunk: the key of its inputs, its file's SHA-256, size and mtime, and its results
+  <mod>/folded.txt             the module's bytes the generated code took as constants: what the jump tables read at
+                               lift time, as module offsets [start, end); exefs patches keep data writes off them
+  patches.h                    code patch sets for the runtime (recomp/patches.py; no sets without --patches)
+
+Function discovery runs in this process, vectorised over the module's .text words. Function starts are the module
+seeds (.eh_frame_hdr, exported FUNC symbols, RELATIVE relocation targets), every BL target, and code addresses
+materialised by ADR or ADRP+ADD (except an ADR that anchors a jump table: one with a `br` in the next 16
+instructions, or one an ADD register form uses as its base right after). A function is [start, next start). A direct branch whose target lies outside its
+function makes the target a new start, until no new start appears.
+
+Emission runs in worker processes, one chunk per task. Each worker loads the modules itself, lifts one function at a
+time and resolves its jump tables (recomp/jumptables.py), so memory per worker does not grow with the module.
+Chunks are sized from a per-instruction estimate of the C they produce, so their names and contents only depend on
+the input; a chunk whose text did not change is not rewritten and keeps its mtime.
+
+A chunk is not lifted again when its inputs did not change. Its text depends only on the generator (recomp/*.py,
+GENERATED_MARKER, the Emitter options), the module (its file, its base, and the function starts discovered from it),
+the chunk's number and functions, and the patch sites, spin waits and function hooks inside the chunk's address
+range (and whether the patch table has hooks at all): the per-module caches of recomp/jumptables.py are derived from
+the module's bytes and base, and its per-function state is reset for each function. The SHA-256 of all of these is the chunk's key. <mod>/lift_cache.json records the key of each chunk
+with the SHA-256, size and mtime of the file it wrote and the results the manifest and folded.txt need, under a
+digest of the entry. A chunk whose entry is intact, whose key matches and whose file still has that size, mtime and
+hash is reused as it is; any other chunk is lifted. So a rebuild after a change lifts only the affected chunks.
+--no-cache, or NSS_LIFT_CACHE=0 in the environment, lifts every chunk.
+"""
+import argparse
+import bisect
+import hashlib
+import json
+import multiprocessing as mp
+import os
+import re
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
+sys.path.insert(0, str(ROOT / 'recomp'))
+
+import flags  # noqa: E402
+import hostmem  # noqa: E402
+import jumptables  # noqa: E402
+import patches  # noqa: E402
+import regs  # noqa: E402
+import vlocals  # noqa: E402
+from check_content import GENERATED_MARKER  # noqa: E402
+from layout import layout, plugin_files, write as write_layout  # noqa: E402
+from lifter import Insn, hx  # noqa: E402
+from module import Module  # noqa: E402
+
+TERMINATORS = ('b', 'br', 'ret', 'trap')
+MUSTTAIL = '__attribute__((musttail)) return'
+
+# Estimated bytes of C per instruction, by class, for chunking (estimate_sizes()).
+# Least squares over every function of main, subsdk0 and sdk (1.2.1) gives 62 / 75 / 48 bytes per instruction, 38
+# per function and 4.5 per instruction of a function with a `br` (switches; the all-label fallback costs about 60
+# per instruction but is rare); the median error per function is 7 %.
+EST_INT = 62
+EST_SIMD = 75
+EST_SIMD_LDST = 48
+EST_FN = 38          # per function: signature, FN_ENTER (recomp/patches.py `hook`), closing brace
+EST_BR_LABELS = 10   # per instruction of a function with a `br`: switch cases, or labels if it falls back
+
+
+def fname(a):
+    return f'f_{a:x}'
+
+
+def orig_name(a):
+    """The unpatched copy of the function at a that a plugin's replace hook reaches as its original (patches.py `orig`)."""
+    return f'fo_{a:x}'
+
+
+def open_module(name, path, base, table, plugin=False):
+    """Module name for lifting: a plugin with a `plugin` line of the patch table (recomp/patches.py) is lifted from its
+    image after the init, its inline-hook stubs returning where they would branch to their trampolines."""
+    p = table.plugins.get(name)
+    if not p:
+        return Module(name, path, base, 'c', plugin=plugin)
+    image = Path(p['image']).read_bytes()
+    mod = Module(name, path, base, 'c', plugin=True, image=image, rets=[o + 12 for o in p['stubs']],
+                 seeds=sorted(p['stubs'] | p['seeds']))
+    t0, t1 = mod.nso.text[0], mod.nso.text[0] + mod.nso.text[1]
+    if hashlib.sha256(image[t0:t1]).hexdigest() != p['sha256']:
+        raise patches.PatchError(f'{name}: {p["image"]} is not the image whose .text the patch table names')
+    for o in p['stubs']:
+        w = int.from_bytes(image[o + 12:o + 16], 'little')
+        if not mod.in_text(base + o) or w >> 26 != 0x05:
+            raise patches.PatchError(f'{name}+{o:#x}: no inline-hook stub (its fourth word {w:08x} is no b)')
+    return mod
+
+
+def header(what):
+    return f'// {GENERATED_MARKER}: {what}, generated by recomp/gen.py from game code. Do not edit or commit.\n'
+
+
+# ------------------------------------------------------------------------------------------------ discovery
+
+def _sext(v, n):
+    v = v.astype(np.int64)
+    return np.where(v & (1 << (n - 1)), v - (1 << n), v)
+
+
+def discover(mod):
+    """Function starts of mod as a sorted int64 array of word indices into mod.words, plus discovery statistics."""
+    w = mod.words
+    n = len(w)
+
+    def idx(mask):
+        return np.flatnonzero(mask).astype(np.int64)
+
+    seeds = (np.asarray(mod.seeds(), dtype=np.int64) - mod.lo) >> 2
+
+    # B and BL: imm26. BL targets are function starts; B targets join the fixpoint below.
+    b_all = idx((w & 0x7C000000) == 0x14000000)
+    imm = _sext(w[b_all] & 0x03FFFFFF, 26)
+    is_bl = (w[b_all] >> 31).astype(bool)
+    bl_tgt = b_all[is_bl] + imm[is_bl]
+    br_src, br_tgt = [b_all[~is_bl]], [b_all[~is_bl] + imm[~is_bl]]
+    # B.cond (the lifter accepts o1 = 1 too), CBZ/CBNZ: imm19 at bit 5. TBZ/TBNZ: imm14 at bit 5.
+    for mask, val, nb in ((0xFE000010, 0x54000000, 19), (0x7E000000, 0x34000000, 19), (0x7E000000, 0x36000000, 14)):
+        s = idx((w & mask) == val)
+        br_src.append(s)
+        br_tgt.append(s + _sext((w[s] >> 5) & ((1 << nb) - 1), nb))
+    br_src, br_tgt = np.concatenate(br_src), np.concatenate(br_tgt)
+    ok = (br_tgt >= 0) & (br_tgt < n)
+    br_src, br_tgt = br_src[ok], br_tgt[ok]
+
+    # ADR: pc + imm21. ADRP: page + (imm21 << 12), then ADD (imm, 64-bit, unshifted) of the same register within
+    # 8 instructions. Targets must be aligned and in .text.
+    def imm21(s):
+        v = w[s]
+        return _sext(((v >> 5) & 0x7FFFF) << 2 | ((v >> 29) & 3), 21)
+
+    pc0 = np.int64(mod.lo)
+    adr = idx((w & 0x9F000000) == 0x10000000)
+    # Clang's jump tables add a table entry to an ADR anchor, the first case block, then `br`. That anchor is not a
+    # function (it would split the switch): an ADR with a `br` in the next 16 instructions is not a seed, nor is one
+    # whose register is the base of an ADD (shifted or extended register) in the next 4 instructions
+    # (`adr xA, L; ldrb wO, [..]; add xA, xA, wO, lsl #2`), however far the scheduler moved the `br`.
+    br = idx((w & 0xFFFFFC1F) == 0xD61F0000)
+    nxt = np.searchsorted(br, adr)
+    has_br = nxt < len(br)
+    near = np.zeros(len(adr), dtype=bool)
+    near[has_br] = br[nxt[has_br]] - adr[has_br] <= 16
+    rd = w[adr] & 31
+    for k in range(1, 5):
+        x = w[np.minimum(adr + k, n - 1)]
+        near |= (((x & 0xFF200000) == 0x8B000000) | ((x & 0xFFE00000) == 0x8B200000)) & (((x >> 5) & 31) == rd)
+    adr = adr[~near]
+    adr_bytes = pc0 + adr * 4 + imm21(adr)
+    is_adrp = (w & 0x9F000000) == 0x90000000
+    add = idx((w & 0xFFC00000) == 0x91000000)
+    rn = ((w[add] >> 5) & 31).astype(np.int64)
+    found = np.full(len(add), -1, dtype=np.int64)
+    for k in range(1, 9):
+        p = add - k
+        cand = (found < 0) & (p >= 0)
+        pc = np.where(cand, p, 0)
+        cand &= is_adrp[pc] & ((w[pc] & 31).astype(np.int64) == rn)
+        found[cand] = p[cand]
+    hit = found >= 0
+    p = found[hit]
+    page = ((pc0 + p * 4) & ~np.int64(0xFFF)) + (imm21(p) << 12)
+    add_bytes = page + ((w[add[hit]] >> 10) & 0xFFF).astype(np.int64)
+    mat = np.concatenate([adr_bytes, add_bytes])
+    mat = mat[(mat >= mod.lo) & (mat < mod.hi) & (mat % 4 == 0)]
+    mat = (mat - pc0) >> 2
+
+    bl_tgt = bl_tgt[(bl_tgt >= 0) & (bl_tgt < n)]
+    starts = np.unique(np.concatenate([seeds, bl_tgt, mat]))
+    stats = {'seeds': int(len(seeds)), 'bl_targets': int(len(np.unique(bl_tgt))),
+             'materialised_targets': int(len(np.unique(mat))), 'initial_starts': int(len(starts))}
+
+    rounds = 0
+    while True:
+        rounds += 1
+        f = np.searchsorted(starts, br_src, side='right') - 1
+        live = f >= 0
+        f = np.where(live, f, 0)
+        lo = starts[f]
+        hi = np.where(f + 1 < len(starts), starts[np.minimum(f + 1, len(starts) - 1)], n)
+        out = live & ((br_tgt < lo) | (br_tgt >= hi))
+        new = np.setdiff1d(br_tgt[out], starts, assume_unique=False)
+        if not len(new):
+            break
+        starts = np.union1d(starts, new)
+    stats['rounds'] = rounds
+    stats['functions'] = int(len(starts))
+    return starts, stats
+
+
+def estimate_sizes(mod, starts):
+    """Estimated bytes of C per function (for chunking only; the manifest records the real sizes)."""
+    w = mod.words
+    cost = np.full(len(w), EST_INT, dtype=np.int64)
+    cost[(w & 0x0E000000) == 0x0E000000] = EST_SIMD                    # FP/AdvSIMD data processing
+    cost[((w & 0x0A000000) == 0x08000000) & (((w >> 26) & 1) == 1)] = EST_SIMD_LDST  # FP/SIMD load/store
+    has_br = np.zeros(len(w), dtype=np.int64)
+    has_br[np.flatnonzero((w & 0xFFFFFC1F) == 0xD61F0000)] = 1           # BR Xn
+    csum = np.concatenate([[0], np.cumsum(cost)])
+    bsum = np.concatenate([[0], np.cumsum(has_br)])
+    ends = np.append(starts[1:], len(w))
+    size = csum[ends] - csum[starts] + EST_FN
+    with_br = (bsum[ends] - bsum[starts]) > 0
+    size[with_br] += (ends[with_br] - starts[with_br]) * EST_BR_LABELS
+    return size
+
+
+def partition(est, max_fns, max_bytes, big_fn):
+    """Contiguous [i0, i1) function ranges: at most max_fns functions and about max_bytes of C each; a function
+    estimated above big_fn gets a file of its own so large functions compile in parallel."""
+    chunks, i0, size = [], 0, 0
+    for i, s in enumerate(est.tolist()):
+        if s > big_fn:
+            if i > i0:
+                chunks.append((i0, i))
+            chunks.append((i, i + 1))
+            i0, size = i + 1, 0
+            continue
+        if i > i0 and (i - i0 >= max_fns or size + s > max_bytes):
+            chunks.append((i0, i))
+            i0, size = i, 0
+        size += s
+    if len(est) > i0:
+        chunks.append((i0, len(est)))
+    return chunks
+
+
+# ------------------------------------------------------------------------------------------------ emission
+
+class Emitter:
+    """C for the functions of one module. starts is the set of every function start of the module. A new input of
+    the C (an argument here, or anything else it reads) must go into the lift cache's key: chunk_key."""
+
+    def __init__(self, mod, starts, patched=None, reg_locals=regs.LOCALS, callee_saved=True, spins=None,
+                 v_locals=vlocals.LOCALS, v_trust=False, hooks=None, fn_enter_all=False, picks=None, origs=None):
+        self.mod = mod
+        self.starts = starts
+        self.patched = patched or {}   # {address: [(set index, [replacement words])]} (recomp/patches.py)
+        self.picks = picks or {}       # {contested site: (pick index, {ordered set: value})} (recomp/patches.py)
+        self.spins = spins or {}       # {spin wait back-edge: its head} (recomp/patches.py `spin`)
+        self.origs = origs or set()    # functions also emitted unpatched, as orig_name() (recomp/patches.py `orig`)
+        self.reg_locals = reg_locals   # recomp/regs.py: registers per function in C locals
+        self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
+        self.v_locals = v_locals   # recomp/vlocals.py: V registers per function in C locals (0: all in c->v)
+        self.v_trust = v_trust     # with v_locals: V8-V15 are not reloaded after a call
+        # Functions that start with FN_ENTER (recomp/patches.py `hook`): None is every function
+        self.hooks = None if fn_enter_all else hooks
+        self.uses_patches = False
+        self.uses_picks = False
+        self.stats = Counter()
+        self.unsupported = Counter()
+
+    def scan(self, insns, entry, end):
+        """Labels and jump tables of one function: {pc: sorted targets} for resolved tables, 'all' for an
+        unresolved computed br."""
+        mod, labels, tables = self.mod, set(), {}
+        for i, ins in enumerate(insns):
+            k = ins.kind
+            if k in ('b', 'bcond'):
+                if entry <= ins.target < end:
+                    labels.add(ins.target)
+            elif k == 'br':
+                a = entry + 4 * i
+                jt = jumptables.resolve(mod, a, entry, end)
+                if jt:
+                    tables[a] = jt
+                    labels.update(jt)
+                    self.stats['jump_tables'] += 1
+                    self.stats['jump_table_targets'] += len(jt)
+                elif jumptables.is_computed(mod, a, entry):
+                    tables[a] = 'all'
+                    self.stats['all_label_fallbacks'] += 1
+                else:
+                    self.stats['br_dispatch'] += 1
+            elif k == 'trap':
+                self.stats['traps'] += 1
+                c = ins.code
+                if c.startswith('rt_udf') and '/*' in c:
+                    self.stats['unsupported'] += 1
+                    msg = c[c.index('/*') + 2:c.rindex('*/')].strip()
+                    self.unsupported[re.sub(r'\b[0-9a-f]{8}\b', '', msg).strip()] += 1
+            elif k == 'asm':
+                raise ValueError(f'{entry + 4 * i:#x}: asm instruction from the portable lifter')
+        for a in self.patched:   # a replacement's branch into the function needs its label
+            if entry <= a < end:
+                for words in self.replacements(a):
+                    r = words[-1]
+                    if r.kind in ('b', 'bcond') and entry <= r.target < end:
+                        labels.add(r.target)
+        return labels, tables
+
+    def replacements(self, a):
+        """The lifted words of each alternative of the patched site a, in set order. Only the last word of an
+        alternative may branch (bl, b, b.cond / cbz / tbz, ret)."""
+        out = []
+        for _, words in self.patched[a]:
+            # ('call', target): a plugin's inline hook (recomp/patches.py @call), before the site's own instruction
+            lifted = [Insn('hook', target=w[1]) if isinstance(w, tuple) else self.mod.lifter.lift(w, a) for w in words]
+            for j, r in enumerate(lifted):
+                last = j == len(lifted) - 1
+                if r.kind == 'hook' and not last:
+                    continue
+                if r.kind != 'op' and not (last and r.kind in ('bl', 'b', 'bcond', 'ret')):
+                    raise patches.PatchError(f'{a:#x}: replacement word {words[j]:08x} is a {r.kind}')
+            out.append(lifted)
+        return out
+
+    def flow(self, insns, entry, end, tables):
+        """Successors of each instruction inside the function [entry, end). Index len(insns) stands for falling
+        through into the next function and has none. A patched site has the successors of all its alternatives."""
+        def idx(t):
+            return [(t - entry) // 4] if entry <= t < end else []
+
+        def of(ins, i):
+            k = ins.kind
+            if k in ('op', 'bl', 'blr'):
+                return [i + 1]
+            if k == 'b':
+                return idx(ins.target)
+            if k == 'bcond':
+                return idx(ins.target) + [i + 1]
+            if k == 'br':
+                jt = tables.get(entry + 4 * i)
+                return [t for x in jt for t in idx(x)] if jt and jt != 'all' else []
+            return []   # ret, trap
+
+        succ = []
+        for i, ins in enumerate(insns):
+            s = of(ins, i)
+            a = entry + 4 * i
+            if a in self.patched:
+                for words in self.replacements(a):
+                    s += [t for t in of(words[-1], i) if t not in s]
+            succ.append(s)
+        succ.append([])
+        return succ
+
+    def flag_plan(self, insns, entry, end, tables, succ):
+        """recomp/flags.py plan for the function: each instruction's flag use over the flow succ (flow())."""
+        n = len(insns)
+        calls, effects, exits = set(), [], {n}
+        for i, ins in enumerate(insns):
+            k, a = ins.kind, entry + 4 * i
+            if k in ('bl', 'blr'):
+                calls.add(i)
+            elif k in ('b', 'bcond') and not entry <= ins.target < end:
+                exits.add(i)
+            elif k == 'br':
+                exits.add(i)   # through rt_dispatch, also a table's default
+            if a in self.patched:
+                effects.append(self.patched_effect(ins, a))
+                for words in self.replacements(a):
+                    r = words[-1]
+                    if r.kind == 'bl':
+                        calls.add(i)
+                    elif r.kind in ('b', 'bcond') and not entry <= r.target < end:
+                        exits.add(i)
+            else:
+                effects.append(flags.effect(ins.cond if k == 'bcond' else ins.code or ''))
+        effects.append((False, None))
+        return flags.plan(effects, succ, calls, exits)
+
+    def patched_effect(self, ins, a):
+        """Flag effect of a patched site: every alternative (the original and each replacement) must write the same
+        flags, in at most one word each; the site reads flags when any alternative does (a b.cond reads them)."""
+        alts = []
+        for words in [[ins]] + self.replacements(a):
+            fx = [flags.effect(w.code or '') if w.kind == 'op' else flags.effect(w.cond) for w in words
+                  if w.kind in ('op', 'bcond')]
+            fx = [e for e in fx if e[0] or e[1]]
+            if len(fx) > 1:
+                raise patches.PatchError(f'{a:#x}: several flag-using words in one alternative')
+            alts.append(fx[0] if fx else (False, None))
+        if any(e[1] != alts[0][1] for e in alts):
+            raise patches.PatchError(f'{a:#x}: the alternatives write different flags ({[e[1] for e in alts]})')
+        reads = any(e[0] for e in alts)
+        if (alts[0][1] or reads) and (ins.kind == 'bl' or any(w[-1].kind == 'bl' for w in self.replacements(a))):
+            raise patches.PatchError(f'{a:#x}: a patched call that uses flags')
+        return reads, alts[0][1]
+
+    def unpatched_copy(self, entry, end, refs):
+        """C of the function [entry, end) without its patched sites, named orig_name(entry): what a plugin's replace
+        hook calls as the original (its trampoline, recomp/patches.py `orig`). Its own fall-back fb_ is renamed too."""
+        kept = self.patched
+        self.patched = {a: alts for a, alts in kept.items() if not entry <= a < end}
+        try:
+            lines, r = self.function(entry, end)
+        finally:
+            self.patched = kept
+        refs |= r
+        text = '\n'.join(lines).replace(f'fb_{entry:x}(', f'fbo_{entry:x}(')
+        head = f'void {fname(entry)}(Cpu *c) {{'
+        if head not in text:
+            raise patches.PatchError(f'{entry:#x}: no function head to rename for its unpatched copy')
+        return text.replace(head, f'void {orig_name(entry)}(Cpu *c) {{', 1)
+
+    def function(self, entry, end):
+        """(lines of C, referenced function starts) for the guest function [entry, end)."""
+        mod, starts = self.mod, self.starts
+        insns = [mod.lift(a) for a in range(entry, end, 4)]
+        labels, tables = self.scan(insns, entry, end)
+        refs = set()
+        all_labels = 'all' in tables.values()
+        if all_labels:
+            labels = set(range(entry, end, 4))
+        # An unresolved computed br re-enters the function through fb_<entry>, a C function of its own, which local
+        # flags would not survive; such functions keep NZCV in c->nzcv.
+        # The same holds for registers in locals (recomp/regs.py): fb_<entry> keeps them in the Cpu too.
+        local = not all_labels
+        spill, reload, reload_call = (regs.SPILL, regs.RELOAD, regs.RELOAD_CALL) if local else ('', '', '')
+        succ = self.flow(insns, entry, end, tables) if local else None
+        fp = self.flag_plan(insns, entry, end, tables, succ) if local else None
+        if fp and fp.used:
+            self.stats['local_flag_functions'] += 1
+            self.stats['flag_reads_direct'] += sum(1 for k in fp.reader if k and k != 'nz')
+            self.stats['flag_reads_packed'] += sum(1 for k in fp.reader if k == 'nz')
+            self.stats['flag_entry_functions'] += fp.entry
+            self.stats['flag_entry_reads'] += fp.entry_read
+            self.stats['flag_reads_after_call'] += fp.after_call
+            self.stats['flag_publishing_exits'] += sum(1 for k in fp.exit if k)
+
+        def fx(i, code):
+            return fp.rewrite(i, code) if fp and fp.used else code
+
+        def publish(i):
+            return fp.publish(i) if fp and fp.used else ''
+
+        def jump(t, i):
+            if entry <= t < end:
+                return f'goto L_{t:x};'
+            if t in starts:
+                refs.add(t)
+                return f'{publish(i)}{spill}{MUSTTAIL} {fname(t)}(c);'
+            self.stats['external_branches'] += 1
+            return f'{publish(i)}{spill}c->pc = {hx(t)}; {MUSTTAIL} rt_dispatch(c);'
+
+        enter = [f'    FN_ENTER({hx(entry)});'] if self.hooks is None or entry in self.hooks else []
+        if all_labels:
+            # An unresolved computed br re-enters the function through fb_<entry>, which switches on c->pc to any
+            # instruction. A goto to a shared dispatch block inside the body instead turns every instruction into
+            # a loop header, and clang's loop passes then take tens of seconds on one function.
+            fb = f'fb_{entry:x}'
+            cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
+            redispatch = f'{MUSTTAIL} {fb}(c);'
+            out = [f'static void {fb}(Cpu *c);',
+                   f'void {fname(entry)}(Cpu *c) {{', *enter, f'    c->pc = {hx(entry)};',
+                   f'    {redispatch}', '}',
+                   f'static void {fb}(Cpu *c) {{', f'    switch (c->pc) {{ {cases} default: break; }}',
+                   f'    {MUSTTAIL} rt_dispatch(c);']
+        else:
+            redispatch = f'{MUSTTAIL} rt_dispatch(c);'
+            out = [f'void {fname(entry)}(Cpu *c) {{', *enter]
+            if fp.used:
+                out.append('    ' + fp.decl())
+
+        def call(t, a):
+            if t in starts:
+                refs.add(t)
+                return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
+            self.stats['external_calls'] += 1
+            return f'c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
+
+        def op(i, code):
+            code = fx(i, code)
+            return f'{spill}{code}{reload}' if regs.ESCAPE.search(code) else code
+
+        def one(i, r, a):
+            """C of one lifted word of a patched site."""
+            if r.kind == 'op':
+                return op(i, r.code)
+            if r.kind == 'bl':
+                return call(r.target, a)
+            if r.kind == 'b':
+                return jump(r.target, i)
+            if r.kind == 'bcond':
+                return f'if ({fx(i, r.cond)}) {{ {jump(r.target, i)} }}'
+            if r.kind == 'ret':
+                return f'{spill}return;'
+            if r.kind == 'hook':
+                # a call that writes no x30, the whole Cpu current before it and read back after it: the stub saves and
+                # restores x30 itself, and the callback may change any register through exlaunch's hook context
+                refs.add(r.target)
+                self.stats['plugin_hook_calls'] += 1
+                return f'{spill}{fname(r.target)}(c);{reload}'
+            raise patches.PatchError(f'{a:#x}: patched instruction is a {r.kind}')
+
+        def patch(i, ins, a):
+            """if (switch) { replacement } else if ... else { original } for a patched site (recomp/patches.py); an
+            ordered set of a contested site tests the site's pick byte instead of its switch."""
+            if ins.kind not in ('op', 'bl', 'b', 'bcond'):
+                raise patches.PatchError(f'{a:#x}: patched instruction is a {ins.kind}')
+            line = '   '
+            n, values = self.picks.get(a, (None, {}))
+            for (k, _), words in zip(self.patched[a], self.replacements(a)):
+                test = f'rt_patch_pick[{n}] == {values[k]}' if k in values else f'rt_patch_on[{k}]'
+                line += f' if ({test}) {{ {" ".join(one(i, r, a) for r in words)} }} else'
+            self.uses_patches = True
+            self.uses_picks |= bool(values)
+            self.stats['patched_sites'] += 1
+            return f'{line} {{ {one(i, ins, a)} }}'
+
+        body = []   # (instruction index or None for a label, line); a line belongs to the instruction it lifts
+
+        def emit(i, line):
+            body.append((i, line))
+
+        k = None
+        for i, ins in enumerate(insns):
+            a = entry + 4 * i
+            if a in labels:
+                emit(None, f'L_{a:x}:;')
+            k = ins.kind
+            if a in self.patched:
+                emit(i, patch(i, ins, a))
+            elif k == 'op':
+                emit(i, '    ' + op(i, ins.code))
+            elif k == 'trap':
+                emit(i, f'    {spill}{fx(i, ins.code)}')
+            elif k in ('b', 'bcond'):
+                j = jump(ins.target, i)
+                if self.spins.get(a) == ins.target and entry <= ins.target < end:
+                    j = f'rt_spin_gate(c, {hx(ins.target)}); {j}'   # a pass of a spin wait
+                    self.stats['spin_gates'] += 1
+                emit(i, '    ' + j if k == 'b' else f'    if ({fx(i, ins.cond)}) {{ {j} }}')
+            elif k == 'bl':
+                emit(i, '    ' + call(ins.target, a))
+            elif k == 'blr':
+                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}')
+            elif k == 'br':
+                jt = tables.get(a)
+                if jt == 'all':
+                    emit(i, f'    c->pc = {ins.target}; {redispatch}')
+                elif jt:
+                    cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in jt)
+                    emit(i, f'    switch ({ins.target}) {{ {cases} default: break; }}')
+                    emit(i, f'    {publish(i)}{spill}c->pc = {ins.target}; {redispatch}')
+                else:
+                    emit(i, f'    {publish(i)}{spill}c->pc = {ins.target}; {MUSTTAIL} rt_dispatch(c);')
+            elif k == 'ret':
+                emit(i, f'    {spill}return;')
+            else:
+                raise ValueError(f'{a:#x}: unknown instruction kind {k!r}')
+        n = len(insns)
+        if k not in TERMINATORS or end - 4 in self.patched:  # falls through into the next function
+            if end < mod.hi:
+                emit(n, '    ' + jump(end, n))
+            else:
+                emit(n, f'    {spill}rt_udf(c, {hx(end)});')
+        if local:
+            texts = [''] * (n + 1)
+            for i, line in body:
+                if i is not None:
+                    texts[i] += line
+            clean = {i for i, ins in enumerate(insns) if entry + 4 * i not in self.patched
+                     and (ins.kind in ('bl', 'blr') or (ins.kind == 'op' and regs.RELOAD in texts[i]))}
+            rp = regs.plan(texts, succ, clean, self.reg_locals, self.kept)
+            if rp.regs:
+                out.append('    ' + rp.decl())
+            self.stats['local_reg_functions'] += bool(rp.regs)
+            self.stats['reg_spills'] += sum(len(s) for s in rp.spill)
+            out += [line if i is None else rp.resolve(i, line) for i, line in body]
+        else:
+            out += [line for _, line in body]
+        out.append('}')
+        if self.v_locals:
+            out = vlocals.rewrite('\n'.join(out), self.v_locals, self.v_trust, self.stats).split('\n')
+        self.stats['functions'] += 1
+        self.stats['instructions'] += len(insns)
+        return out, refs
+
+
+def chunk_text(name, number, emitter, fns):
+    """C text of one chunk. fns: [(entry, end)]."""
+    body, refs = [], set()
+    emitter.uses_patches = emitter.uses_picks = False
+    for entry, end in fns:
+        lines, r = emitter.function(entry, end)
+        body.append('\n'.join(lines))
+        refs |= r
+        if entry in emitter.origs:
+            body.append(emitter.unpatched_copy(entry, end, refs))
+    # Every referenced function gets a prototype, including ones defined later in this chunk.
+    protos = ''.join(f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs))
+    if emitter.uses_patches:
+        protos += 'extern uint8_t rt_patch_on[];\n'
+    if emitter.uses_picks:
+        protos += 'extern uint8_t rt_patch_pick[];\n'
+    vdef = '#define RT_VLOCALS 1\n' if emitter.v_locals else ''   # runtime/simd.h: the V-locals accessors
+    return (header(f'{name} chunk {number:04d}') + vdef + '#include "cpu.h"\n#include "simd.h"\n\n' + protos
+            + '\n' + '\n\n'.join(body) + '\n')
+
+
+def write_if_changed(path, text, wait=True):
+    """Returns True if the file was written. An unchanged file keeps its mtime, so the build skips it. A changed one
+    is written under a temporary name and renamed into place, so a reader never sees it half written. wait: retry
+    the rename while another process holds the file (_retry); without it the first failure raises."""
+    data = text.encode()
+    try:
+        if path.stat().st_size == len(data) and path.read_bytes() == data:
+            return False
+    except FileNotFoundError:
+        pass
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    tmp.write_bytes(data)
+    try:
+        if wait:
+            _retry(os.replace, tmp, path)
+        else:
+            os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _retry(fn, *args):
+    """Windows refuses to rewrite or delete a file another process has open or mapped (clang maps its sources, so a
+    build running on the output holds them; so can a scanner or an editor). Waits up to 30 s for it."""
+    for i in range(120):
+        try:
+            return fn(*args)
+        except OSError as e:
+            if i == 119 or isinstance(e, FileNotFoundError):
+                raise
+            time.sleep(0.25)
+
+
+# ------------------------------------------------------------------------------------------------ workers
+
+_W = {}  # worker state: 'mods' {name: (path, base)}, 'starts' {name: sorted array}, 'emitters' {name: Emitter},
+         # 'reads' {name: [(start, end)]} module bytes read since the last chunk
+
+
+def _worker_init(mods, starts, table, opts, jobs):
+    _W['jobs'] = jobs
+    _W['mods'] = mods
+    _W['starts'] = starts
+    _W['patches'] = table
+    _W['opts'] = opts   # Emitter keyword arguments
+    _W['emitters'] = {}
+    _W['reads'] = {}
+
+
+def _emitter(name):
+    e = _W['emitters'].get(name)
+    if e is None:
+        path, base = _W['mods'][name]
+        mod = open_module(name, path, base, _W['patches'])
+        # Module.read is how the jump tables (recomp/jumptables.py _eval) read .text and .rodata at lift time: the
+        # bytes it returns become part of the generated code, so <mod>/folded.txt lists them
+        read, reads = mod.read, _W['reads'].setdefault(name, [])
+
+        def recorded(a, n, signed=False):
+            reads.append((a - base, a - base + n))
+            return read(a, n, signed=signed)
+        mod.read = recorded
+        e = _W['emitters'][name] = Emitter(mod, set(_W['starts'][name].tolist()),
+                                           _W['patches'].for_module(name, base),
+                                           spins=_W['patches'].spins_for(name, base),
+                                           hooks=_W['patches'].hooks_for(name, base),
+                                           picks=_W['patches'].picks_for(name, base),
+                                           origs=_W['patches'].origs_for(name, base), **_W['opts'])
+    return e
+
+
+def merge_ranges(ranges):
+    """Sorted [start, end) ranges with overlapping and touching ones joined."""
+    out = []
+    for s, e in sorted(ranges):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _emit_chunk(task):
+    """Worker: write one chunk. Returns its statistics, and the SHA-256, size and mtime of its file for the cache."""
+    name, number, path, fns, key = task
+    t0 = time.perf_counter()
+    # Test hook: a pool wider than this raises the MemoryError a busy machine does, so the retry can be exercised.
+    limit = os.environ.get('NSS_LIFT_TEST_OOM_ABOVE')
+    if limit and _W['jobs'] > int(limit) and number % 2 == 1:
+        raise MemoryError
+    e = _emitter(name)
+    e.stats.clear()
+    e.unsupported.clear()
+    text = chunk_text(name, number, e, fns)
+    error, st = None, None
+    try:
+        written = write_if_changed(Path(path), text)
+        st = os.stat(path)
+    except OSError as ex:
+        written, error = False, f'{path}: {ex}'
+    reads = _W['reads'].get(name, [])
+    folded = merge_ranges(reads)
+    reads.clear()
+    return {'module': name, 'number': number, 'file': Path(path).name, 'functions': len(fns), 'bytes': len(text),
+            'written': written, 'reused': False, 'error': error, 'seconds': time.perf_counter() - t0,
+            'stats': dict(e.stats), 'unsupported': dict(e.unsupported), 'folded': folded, 'key': key,
+            'sha256': _sha256(text.encode()), 'size': st.st_size if st else None,
+            'mtime_ns': st.st_mtime_ns if st else None}
+
+
+# ------------------------------------------------------------------------------------------------ driver
+
+def table_text(name, addrs, extra=None):
+    """<mod>_table.c: the function starts and their C; extra {address: C function name} adds entries of functions
+    lifted elsewhere (a plugin's trampoline reaching the unpatched copy of a game function, recomp/patches.py `orig`)."""
+    extra = extra or {}
+    names = {a: fname(a) for a in addrs if a not in extra}
+    names.update(extra)
+    addrs = sorted(names)
+    lines = [header(f'{name} function table'), '#include "cpu.h"\n\n']
+    lines += [f'void {names[a]}(Cpu *c);\n' for a in addrs]
+    lines.append(f'\nconst uint64_t {name}_fn_addrs[] = {{\n')
+    lines.append(',\n'.join(hx(a) for a in addrs))
+    lines.append(f'\n}};\nconst GuestFn {name}_fn_ptrs[] = {{\n')
+    lines.append(',\n'.join(names[a] for a in addrs))
+    lines.append(f'\n}};\nconst uint64_t {name}_fn_count = {len(addrs)};\n')
+    return ''.join(lines)
+
+
+def folded_text(name, ranges):
+    """<mod>/folded.txt: the module offsets [start, end) of the bytes the jump tables read at lift time, in hex."""
+    lines = [f'# {GENERATED_MARKER}: {name} bytes the generated code took as constants (jump tables), module offsets '
+             f'[start, end), generated by recomp/gen.py from game code. Do not edit or commit.']
+    lines += [f'{s:x} {e:x}' for s, e in ranges]
+    return '\n'.join(lines) + '\n'
+
+
+def remove_stale(moddir, name, nchunks, errors):
+    """Delete chunks an earlier run wrote beyond this run's count, and temporary files an interrupted run left."""
+    pat = re.compile(re.escape(name) + r'_(\d{4})\.c')
+    removed = 0
+    for p in moddir.iterdir():
+        m = pat.fullmatch(p.name)
+        if (m and int(m.group(1)) >= nchunks) or (p.name.startswith('.') and p.name.endswith('.tmp')):
+            try:
+                _retry(p.unlink)
+                removed += 1
+            except OSError as ex:
+                errors.append(f'{p}: {ex}')
+    return removed
+
+
+# ------------------------------------------------------------------------------------------------ lift cache
+
+CACHE_FILE = 'lift_cache.json'
+CACHE_VERSION = 1   # raise when the cache's format or the meaning of its key changes
+# Per-chunk results the cache keeps beside the key: what the manifest, folded.txt and the reuse check need.
+CACHED = ('functions', 'bytes', 'stats', 'unsupported', 'folded', 'sha256', 'size', 'mtime_ns')
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _key(*parts):
+    """SHA-256 of JSON-encodable parts."""
+    return _sha256(json.dumps(parts, separators=(',', ':')).encode())
+
+
+def generator_key(opts):
+    """Key of everything the chunk text depends on besides the module and the patches: the generator's sources
+    (recomp/*.py, not the patch tables beside them), the marker in each header, the Emitter options, the Python
+    version that runs them."""
+    srcs = [[p.name, _sha256(p.read_bytes())] for p in sorted((ROOT / 'recomp').glob('*.py'))]
+    return _key('gen', CACHE_VERSION, list(sys.version_info[:2]), GENERATED_MARKER, sorted(opts.items()), srcs)
+
+
+def module_key(gen_key, name, path, base, abs_starts):
+    """Key of one module's inputs: the generator, the module's file and base, and the function starts discovered
+    from them (they decide which branches become direct calls)."""
+    return _key(gen_key, name, _sha256(Path(path).read_bytes()), base, _sha256(abs_starts.tobytes()))
+
+
+def in_span(addrs, lo, hi):
+    """The addresses of the sorted list addrs in [lo, hi)."""
+    return addrs[bisect.bisect_left(addrs, lo):bisect.bisect_left(addrs, hi)]
+
+
+def chunk_key(mod_key, number, fns, patched, site_addrs, spins, spin_addrs, hook_addrs, picks=None, origs=None):
+    """Key of one chunk: its module, number (in its header) and functions, and the patch sites (set index and
+    replacement words, @page resolved, so the patch page is in them), the pick index and values of its contested
+    sites, spin waits and hooked functions inside its address range; hook_addrs None (FN_ENTER in every function) keys
+    apart from an empty list. Every input of the chunk text that is not in generator_key or module_key must be added
+    here, with a case in tests/lift_cache_test.py."""
+    lo, hi = fns[0][0], fns[-1][1]
+    in_chunk = in_span(site_addrs, lo, hi)
+    sites = [[a, [[k, [list(w) if isinstance(w, tuple) else w for w in words]] for k, words in patched[a]]]
+             for a in in_chunk]
+    hooks = None if hook_addrs is None else in_span(hook_addrs, lo, hi)
+    contested = [[a, picks[a][0], sorted(picks[a][1].items())] for a in in_chunk if a in (picks or {})]
+    parts = [mod_key, number, fns, sites, [[b, spins[b]] for b in in_span(spin_addrs, lo, hi)], hooks, contested]
+    copies = [e for e, _ in fns if e in (origs or ())]
+    if copies:   # none: the key it had before plugins
+        parts.append(copies)
+    return _key(*parts)
+
+
+def _entry_check(file, entry):
+    """Digest of a cache entry: its chunk file name, key and results. The results go into the manifest and folded.txt
+    as they are, so a changed value in the cache file must not be taken (tools/exefs_patches.py --folded keeps a
+    mod's data writes off the folded bytes)."""
+    return _key(file, entry['key'], [entry[k] for k in CACHED])
+
+
+def load_cache(moddir):
+    """{chunk file name: entry} from <mod>/lift_cache.json: the entries whose digest matches; empty when the file is
+    missing or unreadable."""
+    try:
+        data = json.loads((moddir / CACHE_FILE).read_text())
+        if data.get('version') != CACHE_VERSION or not isinstance(data.get('chunks'), dict):
+            return {}
+        out = {}
+        for file, e in data['chunks'].items():
+            try:
+                if e['check'] == _entry_check(file, e):
+                    out[file] = e
+            except (KeyError, TypeError):
+                pass
+        return out
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _intact(path, entry):
+    """True when the file at path still is the one the entry recorded: same size and mtime, then same SHA-256 (a bit
+    flipped in a kept file would otherwise stay forever, as tools/build_game.py check_objects says of objects)."""
+    try:
+        st = path.stat()
+        if st.st_size != entry['size'] or st.st_mtime_ns != entry['mtime_ns']:
+            return False
+        return _sha256(path.read_bytes()) == entry['sha256']
+    except (OSError, KeyError, TypeError):
+        return False
+
+
+def reuse(tasks, caches):
+    """The results of the tasks whose chunk can be reused: its recorded key equals the task's and its file is intact.
+    The files are hashed on threads (hashlib releases the GIL), about 1 GB in all for the three modules."""
+    cands = []
+    for name, number, path, fns, key in tasks:
+        e = caches.get(name, {}).get(Path(path).name)
+        if e is not None and e['key'] == key:
+            cands.append((name, number, Path(path), key, e))
+    with ThreadPoolExecutor(min(16, os.cpu_count() or 4)) as ex:
+        ok = list(ex.map(lambda c: _intact(c[2], c[4]), cands))
+    out = []
+    for (name, number, path, key, e), good in zip(cands, ok):
+        if good:
+            out.append({'module': name, 'number': number, 'file': path.name, 'written': False, 'reused': True,
+                        'error': None, 'seconds': 0.0, 'key': key, **{k: e[k] for k in CACHED}})
+    return out
+
+
+def cache_text(name, results):
+    """<mod>/lift_cache.json for this run's chunks; a chunk that could not be written gets no entry. Keys keep their
+    order (no sort_keys), so a reused chunk's `unsupported` merges into the census as it did when it was lifted."""
+    chunks = {}
+    for r in results:
+        if not r['error'] and r['size'] is not None:
+            e = {'key': r['key'], **{k: r[k] for k in CACHED}}
+            chunks[r['file']] = {**e, 'check': _entry_check(r['file'], e)}
+    return json.dumps({'module': name, 'marker': GENERATED_MARKER, 'version': CACHE_VERSION, 'chunks': chunks},
+                      separators=(',', ':')) + '\n'
+
+
+# Peak memory of one emit worker on 1.4.3 is 1.3 GiB (1.5 GiB with margin); the parent holds about 0.7 GiB.
+WORKER_MEM = 1536 << 20
+MEM_SHARE = 0.8  # of the free memory the workers may take, the rest is for the system and other programs
+
+
+def pick_jobs(requested):
+    """Worker count and the reason for it: --jobs if given, else the CPU count capped by the free memory."""
+    if requested:
+        return requested, '--jobs'
+    env = os.environ.get('NSS_LIFT_JOBS', '').strip()
+    if env:
+        try:
+            if int(env) >= 1:
+                return int(env), 'NSS_LIFT_JOBS'
+        except ValueError:
+            pass
+        print(f'ignoring NSS_LIFT_JOBS={env!r}: not a positive integer', file=sys.stderr, flush=True)
+    cpus = os.cpu_count() or 4
+    free = hostmem.available_ram()
+    if free is None:
+        return cpus, f'{cpus} CPUs, free memory unknown'
+    by_mem = max(1, int(free * MEM_SHARE) // WORKER_MEM)
+    return min(cpus, by_mem), f'{cpus} CPUs, {free / 2**30:.1f} GiB free memory allows {by_mem}'
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('--exefs', type=Path, required=True)
+    ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--modules', default='main,subsdk0,sdk', help='modules to lift (default main,subsdk0,sdk and every '
+                                                                  '--plugins module)')
+    ap.add_argument('--plugins', default='', help='comma-separated plugin NSOs (exefs/subsdk* of a mod), in mod load '
+                                                   'order: lifted as plugin0..N after sdk')
+    ap.add_argument('--jobs', type=int, help='emit workers (default: by free memory and CPU count)')
+    ap.add_argument('--limit', type=int, default=0, help='emit only the first N functions of each module')
+    ap.add_argument('--chunk-fns', type=int, default=3000, help='functions per chunk at most')
+    ap.add_argument('--chunk-bytes', type=int, default=3000000, help='estimated bytes of C per chunk')
+    ap.add_argument('--big-fn', type=int, default=300000, help='estimated bytes of C from which a function gets '
+                                                               'its own chunk')
+    ap.add_argument('--patches', type=Path, help='code patch table (recomp/patches.py)')
+    ap.add_argument('--reg-locals', type=int, default=regs.LOCALS,
+                    help=f'guest registers per function kept in C locals (recomp/regs.py; default {regs.LOCALS}, 0: none)')
+    ap.add_argument('--no-callee-saved-trust', action='store_true',
+                    help='reload X19-X29 and SP after every call too, instead of trusting AAPCS64 (slower; for '
+                         'telling a broken callee from a generator bug)')
+    ap.add_argument('--v-locals', type=int, default=vlocals.LOCALS,
+                    help='V registers per function kept in C locals that clang holds in XMM registers, the most used '
+                         f'ones (recomp/vlocals.py; default {vlocals.LOCALS}, 0: all in the Cpu)')
+    ap.add_argument('--v-trust', action='store_true',
+                    help='with --v-locals: do not reload V8-V15 after a call (AAPCS64: the callee preserves their low '
+                         '64 bits)')
+    ap.add_argument('--fn-enter-all', action='store_true',
+                    help='FN_ENTER (runtime/cpu.h) in every function, also with hook lines in the patch table '
+                         '(recomp/patches.py `hook`): a whole-game function-entry profile')
+    ap.add_argument('--no-cache', action='store_true',
+                    help=f'lift every chunk, also those whose inputs match <mod>/{CACHE_FILE} (it is written anew); '
+                         'so does the environment variable NSS_LIFT_CACHE=0')
+    args = ap.parse_args()
+    # The installer's lift step passes no --no-cache; the environment reaches it, as NSS_LIFT_JOBS does (pick_jobs)
+    no_cache = ('--no-cache' if args.no_cache else
+                'NSS_LIFT_CACHE=0' if os.environ.get('NSS_LIFT_CACHE', '').strip() == '0' else None)
+    opts = {'reg_locals': args.reg_locals, 'callee_saved': not args.no_callee_saved_trust, 'v_locals': args.v_locals,
+            'v_trust': args.v_trust, 'fn_enter_all': args.fn_enter_all}
+    gen_key = generator_key(opts)
+
+    t0 = time.perf_counter()
+    plugins = [Path(p) for p in args.plugins.split(',') if p]
+    mods = layout(args.exefs, plugins)
+    files = plugin_files(plugins)
+    write_layout(mods, args.out, files)
+    table = patches.load(args.patches, mods) if args.patches else patches.Table()
+    write_if_changed(args.out / 'patches.h', patches.header_text(table, GENERATED_MARKER))
+    want = args.modules.split(',') + list(files)
+    unknown = set(want) - {n for n, _, _ in mods}
+    if unknown:
+        raise SystemExit(f'not in {args.exefs}: {", ".join(sorted(unknown))}')
+
+    paths, starts_abs, info, tasks = {}, {}, {}, []
+    for name, base, _ in mods:
+        if name not in want:
+            continue
+        t = time.perf_counter()
+        path = Path(files[name][0]) if name in files else args.exefs / name
+        mod = open_module(name, path, base, table, plugin=name in files)
+        patches.check(table, mod, name)
+        starts, dstats = discover(mod)
+        est = estimate_sizes(mod, starts)
+        abs_starts = mod.lo + starts * 4
+        n = len(starts) if not args.limit else min(args.limit, len(starts))
+        ends = np.append(abs_starts[1:], mod.hi)
+        chunks = partition(est[:n], args.chunk_fns, args.chunk_bytes, args.big_fn)
+        moddir = args.out / name
+        moddir.mkdir(parents=True, exist_ok=True)
+        extra = table.orig_entries(name, {n: b for n, b, _ in mods})
+        if extra:   # a trampoline reaches another function's unpatched copy, not a lift of its own words
+            keep = ~np.isin(abs_starts, np.array(sorted(extra), dtype=abs_starts.dtype))
+            starts, est, abs_starts = starts[keep], est[keep], abs_starts[keep]
+            n = len(starts) if not args.limit else min(args.limit, len(starts))
+            ends = np.append(abs_starts[1:], mod.hi)
+            chunks = partition(est[:n], args.chunk_fns, args.chunk_bytes, args.big_fn)
+        missing = sorted(base + o for o in (table.plugins.get(name) or {}).get('seeds', ())
+                         if base + o not in set(abs_starts.tolist()))
+        if missing:
+            raise SystemExit(f'{name}: the seeds {", ".join(hex(a) for a in missing)} are no function starts')
+        mkey = module_key(gen_key, name, path, base, abs_starts)
+        if table.plugin_inputs(name):
+            mkey = _key(mkey, table.plugin_inputs(name), _sha256(Path(table.plugins[name]['image']).read_bytes()))
+        patched, spins, picks = table.for_module(name, base), table.spins_for(name, base), table.picks_for(name, base)
+        origs = table.origs_for(name, base)
+        bad = sorted(origs - set(abs_starts.tolist()))
+        if bad:
+            raise SystemExit(f'{args.patches}: orig {", ".join(hex(a) for a in bad)} is no function start of {name}')
+        site_addrs, spin_addrs = sorted(patched), sorted(spins)
+        hooks = None if args.fn_enter_all else table.hooks_for(name, base)
+        stray = sorted(set(hooks or ()) - set(abs_starts.tolist()))
+        if stray:
+            raise SystemExit(f'{args.patches}: hook {", ".join(f"{name}+{a - base:#x}" for a in stray)} is no function '
+                             f'start of {name}')
+        hook_addrs = None if hooks is None else sorted(hooks)
+        for number, (i0, i1) in enumerate(chunks):
+            fns = list(zip(abs_starts[i0:i1].tolist(), ends[i0:i1].tolist()))
+            key = chunk_key(mkey, number, fns, patched, site_addrs, spins, spin_addrs, hook_addrs, picks, origs)
+            tasks.append((int(est[i0:i1].sum()), (name, number, str(moddir / f'{name}_{number:04d}.c'), fns, key)))
+        paths[name] = (str(path), base)
+        starts_abs[name] = abs_starts
+        info[name] = {'base': base, 'lo': mod.lo, 'hi': mod.hi, 'emitted': abs_starts[:n].tolist(), 'extra': extra,
+                      'chunks': len(chunks), 'discover': dstats, 'discover_seconds': time.perf_counter() - t,
+                      'moddir': moddir}
+        print(f'{name}: {dstats["functions"]} functions ({dstats["seeds"]} seeds, {dstats["rounds"]} rounds), '
+              f'{len(chunks)} chunks, discovery {time.perf_counter() - t:.1f}s', file=sys.stderr, flush=True)
+        del mod
+
+    # Largest chunks first, so the pool does not end on a long tail.
+    tasks.sort(key=lambda t: -t[0])
+    results = {name: [] for name in info}
+    folded = {name: [] for name in info}
+    done_at, errors = {}, []
+    t_emit = time.perf_counter()
+    ctx = mp.get_context('spawn')
+    jobs, why = pick_jobs(args.jobs)
+    pending = [t for _, t in tasks]
+    reused = [] if no_cache else reuse(pending, {name: load_cache(d['moddir']) for name, d in info.items()})
+    for r in reused:
+        results[r['module']].append(r)
+        folded[r['module']] += r['folded']
+    skip = {(r['module'], r['number']) for r in reused}
+    pending = [t for t in pending if (t[0], t[1]) not in skip]
+    emitted = len(reused)
+    print(f'reusing {len(reused)} of {len(tasks)} chunks (inputs unchanged), {time.perf_counter() - t_emit:.1f}s'
+          if not no_cache else f'lifting every chunk ({no_cache})', file=sys.stderr, flush=True)
+    if reused or not pending:
+        # installer/steps.py EMITTED reads these lines for its progress bar: the reused chunks count as done, and a
+        # run with nothing to lift still reaches M/M
+        print(f'emitted {emitted}/{len(tasks)} chunks, 0s', file=sys.stderr, flush=True)
+    if len(pending) < jobs:
+        jobs, why = max(1, len(pending)), f'{len(pending)} chunk{"s" if len(pending) != 1 else ""} to lift'
+    while pending:
+        print(f'emitting with {jobs} worker{"s" if jobs != 1 else ""} ({why})', file=sys.stderr, flush=True)
+        try:
+            # Chunk writes are atomic and idempotent, so a chunk lost with a failed pool is simply emitted again.
+            # Its folded bytes come with its result: a chunk emitted again reads them again in its new worker.
+            with ctx.Pool(jobs, initializer=_worker_init, initargs=(paths, starts_abs, table, opts, jobs)) as pool:
+                for r in pool.imap_unordered(_emit_chunk, pending, chunksize=1):
+                    results[r['module']].append(r)
+                    folded[r['module']] += r['folded']
+                    if r['error']:
+                        errors.append(r['error'])
+                    done_at[r['module']] = time.perf_counter() - t_emit
+                    emitted += 1
+                    if emitted % 200 == 0 or emitted == len(tasks):
+                        print(f'emitted {emitted}/{len(tasks)} chunks, {time.perf_counter() - t_emit:.0f}s',
+                              file=sys.stderr, flush=True)
+            break
+        except MemoryError:
+            if jobs == 1:
+                raise
+            smaller = jobs // 2
+            print(f'emit: out of memory with {jobs} workers, retrying with {smaller}', file=sys.stderr, flush=True)
+            jobs, why = smaller, 'after out of memory'
+            done = {(r['module'], r['number']) for rs in results.values() for r in rs}
+            pending = [t for t in pending if (t[0], t[1]) not in done]
+
+    for name, d in info.items():
+        rs = sorted(results[name], key=lambda r: r['number'])
+        moddir = d['moddir']
+        stats, unsupported = Counter(), Counter()
+        for r in rs:
+            stats.update(r['stats'])
+            unsupported.update(r['unsupported'])
+        t = time.perf_counter()
+        table_written = write_if_changed(moddir / f'{name}_table.c', table_text(
+            name, d['emitted'], {t: orig_name(f) for t, f in d['extra'].items()}))
+        write_if_changed(moddir / 'folded.txt', folded_text(name, merge_ranges(folded[name])))
+        removed = remove_stale(moddir, name, d['chunks'], errors)
+        manifest = {
+            'module': name,
+            'marker': GENERATED_MARKER,
+            'base': f'{d["base"]:#x}',
+            'text': [f'{d["lo"]:#x}', f'{d["hi"]:#x}'],
+            'function_count': len(d['emitted']),
+            'chunks': [r['file'] for r in rs],
+            'table': f'{name}_table.c',
+            'chunk_info': [{'file': r['file'], 'functions': r['functions'], 'bytes': r['bytes'],
+                            'seconds': round(r['seconds'], 2)} for r in rs],
+            'stats': {
+                **d['discover'],
+                'emitted_functions': stats['functions'],
+                'instructions': stats['instructions'],
+                'jump_tables': stats['jump_tables'],
+                'jump_table_targets': stats['jump_table_targets'],
+                'all_label_fallbacks': stats['all_label_fallbacks'],
+                'br_dispatch': stats['br_dispatch'],
+                'traps': stats['traps'],
+                'patched_sites': stats['patched_sites'],
+                'local_flag_functions': stats['local_flag_functions'],
+                'flag_reads_direct': stats['flag_reads_direct'],
+                'flag_reads_packed': stats['flag_reads_packed'],
+                'flag_entry_functions': stats['flag_entry_functions'],
+                'flag_entry_reads': stats['flag_entry_reads'],
+                'flag_reads_after_call': stats['flag_reads_after_call'],
+                'flag_publishing_exits': stats['flag_publishing_exits'],
+                'spin_gates': stats['spin_gates'],
+                'unsupported': stats['unsupported'],
+                'external_branches': stats['external_branches'],
+                'external_calls': stats['external_calls'],
+                'c_bytes': sum(r['bytes'] for r in rs),
+                'largest_chunk_bytes': max((r['bytes'] for r in rs), default=0),
+                'chunks_written': sum(r['written'] for r in rs) + table_written,
+                'chunks_reused': sum(r['reused'] for r in rs),
+                'stale_chunks_removed': removed,
+                **{k: v for k, v in sorted(stats.items()) if k.startswith('v_')},   # --v-locals only
+            },
+            'unsupported_census': dict(unsupported.most_common(50)),
+            'timings': {
+                'discover_s': round(d['discover_seconds'], 2),
+                'emit_wall_s': round(done_at.get(name, 0.0), 2),
+                'emit_worker_s': round(sum(r['seconds'] for r in rs), 2),
+                'table_s': round(time.perf_counter() - t, 2),
+            },
+        }
+        write_if_changed(moddir / 'manifest.json', json.dumps(manifest, indent=1) + '\n')
+        # The cache goes last, after every output it describes. It only saves time, so a failed write warns and the
+        # lift still succeeds, without waiting for a holder of the file: the previous cache stays, and its entries
+        # for the chunks this run rewrote no longer match their files' size, mtime and hash. A run stopped before
+        # here leaves it the same way.
+        try:
+            write_if_changed(moddir / CACHE_FILE, cache_text(name, rs), wait=False)
+        except OSError as ex:
+            print(f'{name}: {CACHE_FILE} not written, the next lift reuses less: {ex}', file=sys.stderr, flush=True)
+        s = manifest['stats']
+        print(f'{name}: {s["emitted_functions"]} functions, {len(rs)} chunks ({s["chunks_reused"]} reused), '
+              f'{s["c_bytes"] / 1e6:.0f} MB of C, '
+              f'{s["jump_tables"]} jump tables, {s["all_label_fallbacks"]} all-label fallbacks, '
+              f'{s["br_dispatch"]} br via dispatch, {s["traps"]} traps ({s["unsupported"]} unsupported)',
+              file=sys.stderr)
+    print(f'total {time.perf_counter() - t0:.0f}s', file=sys.stderr)
+    if errors:
+        print(f'{len(errors)} files could not be written or removed (held open by another process?):',
+              file=sys.stderr)
+        for e in errors:
+            print(f'  {e}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
