@@ -377,6 +377,14 @@ static int create_device(void) {
         gpl_link = tail;
         CHAIN(gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
     }
+    if (has_ext(ep, ne, VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME)) {
+        g_vk.has_nv_gs_passthrough = 1;
+        ext[n_ext++] = VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME;
+    }
+    if (has_ext(ep, ne, VK_NV_VIEWPORT_ARRAY_2_EXTENSION_NAME)) {
+        g_vk.has_nv_viewport_array2 = 1;
+        ext[n_ext++] = VK_NV_VIEWPORT_ARRAY_2_EXTENSION_NAME;
+    }
     free(ep);
 
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
@@ -404,6 +412,8 @@ static int create_device(void) {
     else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    rt_log("vk: geometry shader passthrough=%d viewport_array2=%d multiViewport=%d",
+           g_vk.has_nv_gs_passthrough, g_vk.has_nv_viewport_array2, (int)h->multiViewport);
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     // Vulkan 1.3 requires the feature, and the chain goes to vkCreateDevice as the driver filled it, so it is enabled
     // wherever reported; vk_pipeline.c spirv_demote emits OpDemoteToHelperInvocation only when it is.

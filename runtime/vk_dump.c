@@ -39,11 +39,12 @@
 #define MAX_PASSES 400
 #define PNG_CAP (2ull << 30)
 #define INFLIGHT_CAP (3ull << 30)   // host buffers waiting for their submission
-#define MAX_ENTS 48                 // distinct pipeline + texture sets listed per pass
+#define MAX_ENTS 256                // distinct pipeline + texture sets listed per pass
 #define MAX_LUTS 256                // 3D textures and small sampled 8-bit 2D textures dumped per frame
 #define TEX2D_CAP (1u << 20)        // texels of a sampled 2D texture that is dumped
 
 int vk_dump_armed;
+static volatile int32_t f12_pending;
 static uint64_t dump_frame, log_from;   // log_from: TOTK_DUMP_LOG, first frame logged to passes.txt without images
 static char dir[400];
 static FILE *passes_f, *images_f;
@@ -444,7 +445,7 @@ static void buf_snap(VkExec *ex, int pass) {
 
 static int active(void) {
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
+    return !finished && passes_f && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
 
@@ -468,11 +469,11 @@ __attribute__((format(printf, 2, 3))) static void sp(Str *b, const char *fmt, ..
 }
 
 // SPIR-V hash of a shader; the first time, its SPIR-V goes to sh_<hash>.spv.
+static int sh_n;
 static uint64_t shader_hash(const GfxShader *s) {
     static struct { const GfxShader *s; uint64_t h; } tab[1024];
-    static int n;
     if (!s) return 0;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < sh_n; i++)
         if (tab[i].s == s) return tab[i].h;
     uint64_t words = 0, h = 0xcbf29ce484222325ull;
     const uint32_t *w = gfx_shader_spirv(s, &words);
@@ -482,14 +483,14 @@ static uint64_t shader_hash(const GfxShader *s) {
     snprintf(path, sizeof path, "%s/sh_%016llx.spv", dir, (unsigned long long)h);
     FILE *f = fopen(path, "wb");
     if (f) fwrite(w, 4, (size_t)words, f), fclose(f);
-    if (n < 1024) tab[n].s = s, tab[n].h = h, n++;
+    if (sh_n < 1024) tab[sh_n].s = s, tab[sh_n].h = h, sh_n++;
     return h;
 }
 
 // Per pass: distinct pipeline + texture sets, draws, 3D textures to copy at its end.
 typedef struct { VkPipeline p; uint64_t th; int draws; char *text; } Ent;
 static Ent ents[MAX_ENTS];
-static int nents, ents_over, pass_draws;
+static int nents, ents_over, pass_draws, pass_kind[3], pass_ind_zero, pass_ind_dev;
 typedef struct { VkImage image; VkFormat format; uint32_t w, h, d; int id, is2d; } Lut;
 static Lut luts[MAX_LUTS];          // queued for the next pass end or dispatch
 static int nluts;
@@ -533,7 +534,9 @@ static void flush_luts(VkExec *ex, int n) {
     nluts = 0;
 }
 
-static int nvn_stage(int gfx_stage) { return gfx_stage == GFX_STAGE_VS ? 0 : gfx_stage == GFX_STAGE_FS ? 1 : 5; }
+static int nvn_stage(int gfx_stage) {
+    return gfx_stage == GFX_STAGE_VS ? 0 : gfx_stage == GFX_STAGE_GS ? 2 : gfx_stage == GFX_STAGE_FS ? 1 : 5;
+}
 
 static const char *decl_type(uint16_t t, char tmp[24]) {
     static const char *base[] = {"?", "1D", "buffer", "2D", "3D", "cube"};
@@ -555,7 +558,7 @@ static uint64_t handle_of(const VkExec *ex, int st, int slot, int img) {
 
 // The textures, images and samplers of info's bindings; 3D textures are queued for a copy.
 static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) {
-    static const char *stn[6] = {"vs", "fs", "?", "?", "?", "cs"};
+    static const char *stn[6] = {"vs", "fs", "gs", "?", "?", "cs"};
     for (uint32_t i = 0; i < info->n_bindings; i++) {
         const VkPipeBinding *bd = &info->bindings[i];
         const GfxShaderRes *r = bd->res;
@@ -671,7 +674,29 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     pass_draws++;
+    uint8_t kind = ex->dump_draw_kind < 3 ? ex->dump_draw_kind : 0;
+    pass_kind[kind]++;
+    int ind_host = 0, ind_dev = 0;
+    uint32_t ind_w[5] = {0};
+    if (kind == 2) {
+        VkMemSpan isp;
+        if (vk_mem_resolve(ex->dump_ind_addr, sizeof ind_w, &isp)) {
+            if (!isp.alloc) {
+                memcpy(ind_w, (const void *)(uintptr_t)ex->dump_ind_addr, sizeof ind_w);
+                ind_host = 1;
+                if (ind_w[0] == 0 || ind_w[1] == 0) pass_ind_zero++;
+            } else {
+                ind_dev = 1;
+                pass_ind_dev++;
+            }
+        }
+    }
     uint64_t th = bindings_hash(ex, info);
+    uint64_t st_tag = (uint64_t)kind | ((uint64_t)s->ds.dt << 2) | ((uint64_t)s->ds.dw << 3) |
+                      ((uint64_t)s->ds.df << 4) | ((uint64_t)s->ds.st << 8) | ((uint64_t)s->poly.cull << 9) |
+                      ((uint64_t)(s->chmask.mask & 0xfu) << 11) | ((uint64_t)(s->color.blend_en & 1u) << 15) |
+                      ((uint64_t)(s->raster_discard != 0) << 16);
+    th = (th ^ st_tag) * 0x100000001b3ull;
     for (int i = 0; i < nents; i++)
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
@@ -681,9 +706,25 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
         ents_over++;
         goto out;
     }
+    static const char *const kname[3] = {"draw", "idx", "idx_ind"};
     Str b = {0};
-    sp(&b, "vs %016llx fs %016llx prog %llu prim %d\n", (unsigned long long)shader_hash(s->vs),
-       (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0), s->prim);
+    sp(&b, "vs %016llx", (unsigned long long)shader_hash(s->vs));
+    if (s->gs) sp(&b, " gs %016llx", (unsigned long long)shader_hash(s->gs));
+    sp(&b, " fs %016llx prog %llu nst %d stages %#x prim %d kind %s cnt %d | dt %d dw %d df %d st %d cull %d front %d wmask0 %#x blend0 %d disc %d",
+       (unsigned long long)shader_hash(s->fs),
+       (unsigned long long)(ex->prog ? ex->prog->serial : 0), ex->prog ? (int)ex->prog->nstage : 0,
+       (unsigned)ex->prog_stages, s->prim, kname[kind], ex->dump_draw_count, (int)s->ds.dt, (int)s->ds.dw,
+       (int)s->ds.df, (int)s->ds.st, (int)s->poly.cull, (int)s->poly.front, (unsigned)(s->chmask.mask & 0xfu),
+       (int)(s->color.blend_en & 1u), (int)(s->raster_discard != 0));
+    if (kind == 2) {
+        if (ind_host)
+            sp(&b, " | ind %#llx (%u,%u,%u,%d,%u) ibuf %#llx", (unsigned long long)ex->dump_ind_addr,
+               ind_w[0], ind_w[1], ind_w[2], (int32_t)ind_w[3], ind_w[4], (unsigned long long)ex->dump_ibuf_addr);
+        else
+            sp(&b, " | ind %#llx (%s) ibuf %#llx", (unsigned long long)ex->dump_ind_addr,
+               ind_dev ? "dev" : "unbacked", (unsigned long long)ex->dump_ibuf_addr);
+    }
+    sp(&b, "\n");
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
 out:
@@ -739,7 +780,8 @@ void vk_dump_pass_end(VkExec *ex) {
     uint64_t sig = targets_sig(ex);
     pass_decide(skip_runs && sig == last_targets);
     last_targets = sig;
-    fprintf(passes_f, "pass %04d: render pass, draws %d, area %ux%u layers %u, fence %llu, frame %llu\n", n, pass_draws,
+    fprintf(passes_f, "pass %04d: render pass, draws %d (draw %d idx %d ind %d [ind_zero %d ind_dev %d]), area %ux%u layers %u, fence %llu, frame %llu\n",
+            n, pass_draws, pass_kind[0], pass_kind[1], pass_kind[2], pass_ind_zero, pass_ind_dev,
             ex->pass_w, ex->pass_h, ex->pass_layers, (unsigned long long)ex->fence, (unsigned long long)frame_now());
     for (int i = 0; i < 8; i++) {
         if (!ex->color[i].tex) continue;
@@ -758,6 +800,7 @@ void vk_dump_pass_end(VkExec *ex) {
     buf_snap(ex, n);
     fflush(passes_f);
     nents = ents_over = pass_draws = 0;
+    pass_kind[0] = pass_kind[1] = pass_kind[2] = pass_ind_zero = pass_ind_dev = 0;
 out:
     plat_mutex_unlock(&rec_lock);
 }
@@ -862,11 +905,7 @@ out:
 
 static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 
-void vk_dump_init(void) {
-    const char *e = cfg_get("TOTK_DUMP");
-    if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
-    const char *lf = cfg_get("TOTK_DUMP_LOG");
-    if (lf && *lf) log_from = strtoull(lf, NULL, 10);
+static int dump_open_files(uint64_t target_frame, uint64_t from_frame, int fatal_on_err) {
     const char *sr = cfg_get("TOTK_DUMP_SKIP_RUNS");
     skip_runs = sr && *sr && *sr != '0';
     const char *du = cfg_get("TOTK_DUMP_UBO");
@@ -874,6 +913,7 @@ void vk_dump_init(void) {
     if (dump_ubo == 1) dump_ubo = 16;
     if (dump_ubo > 4096) dump_ubo = 4096;
     if (dump_ubo < 0) dump_ubo = 0;
+    nwant_tex = 0;
     const char *wt = cfg_get("TOTK_DUMP_TEX");
     for (char *q = (char *)wt; q && *q && nwant_tex < 16; q += *q == ',') {
         uint32_t *w = want_tex[nwant_tex++];
@@ -883,12 +923,30 @@ void vk_dump_init(void) {
     const char *d = cfg_get("TOTK_DUMP_DIR");
     snprintf(dir, sizeof dir, "%s", d && *d ? d : "dump");
     make_dirs(dir);
+    plat_mutex_lock(&rec_lock);
+    for (int i = 0; i < nents; i++) free(ents[i].text);
+    nents = ents_over = pass_draws = 0;
+    pass_kind[0] = pass_kind[1] = pass_kind[2] = pass_ind_zero = pass_ind_dev = 0;
+    nluts = nluts_done = sh_n = 0;
+    seq = copied = finished = 0;
+    last_targets = 0;
+    pass_skip = NULL;
+    png_bytes = 0;
+    dump_frame = target_frame;
+    log_from = from_frame;
     char path[600];
     snprintf(path, sizeof path, "%s/passes.txt", dir);
     passes_f = fopen(path, "w");
     snprintf(path, sizeof path, "%s/images.txt", dir);
     images_f = fopen(path, "w");
-    if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
+    if (!passes_f || !images_f) {
+        if (passes_f) fclose(passes_f), passes_f = NULL;
+        if (images_f) fclose(images_f), images_f = NULL;
+        plat_mutex_unlock(&rec_lock);
+        if (fatal_on_err) rt_fatal("vk_dump: cannot write to %s", dir);
+        rt_log("vk_dump: cannot write to %s", dir);
+        return 0;
+    }
     const char *bf = cfg_get("TOTK_DUMP_BUF");
     if (bf && *bf) {
         char *q;
@@ -902,23 +960,47 @@ void vk_dump_init(void) {
         snprintf(path, sizeof path, "%s/bufs.txt", dir);
         if (bd_size && !(bufs_f = fopen(path, "w"))) bd_size = 0;
     }
-    vk_dump_armed = 1;
-    rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    plat_mutex_unlock(&rec_lock);
+    __atomic_store_n(&vk_dump_armed, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+void vk_dump_init(void) {
+    const char *e = cfg_get("TOTK_DUMP");
+    uint64_t df = 0, lf_val = 0;
+    if (!e || !*e || !(df = strtoull(e, NULL, 10))) return;
+    const char *lf = cfg_get("TOTK_DUMP_LOG");
+    if (lf && *lf) lf_val = strtoull(lf, NULL, 10);
+    if (dump_open_files(df, lf_val, 1))
+        rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+}
+
+void vk_dump_trigger(void) {
+    plat_xchg32(&f12_pending, 1);
+    rt_log("vk_dump: F12 dump requested");
 }
 
 void vk_dump_present(uint64_t frame) {
+    if (!vk_dump_armed) {
+        if (plat_xchg32(&f12_pending, 0)) {
+            if (dump_open_files(frame + 3, 0, 0))
+                rt_log("vk_dump: F12 armed for frame %llu -> %s", (unsigned long long)dump_frame, dir);
+        }
+        return;
+    }
     if (frame != dump_frame) return;
     plat_mutex_lock(&rec_lock);
     finished = 1;
     plat_mutex_unlock(&rec_lock);
     vk_sync_finish();   // the frame's copies are converted and written
     plat_mutex_lock(&img_lock);
-    fclose(images_f);
-    images_f = NULL;
+    if (images_f) fclose(images_f), images_f = NULL;
     if (bufs_f) fclose(bufs_f), bufs_f = NULL;
     plat_mutex_unlock(&img_lock);
-    fclose(passes_f);
-    passes_f = NULL;
+    plat_mutex_lock(&rec_lock);
+    if (passes_f) fclose(passes_f), passes_f = NULL;
+    plat_mutex_unlock(&rec_lock);
+    __atomic_store_n(&vk_dump_armed, 0, __ATOMIC_RELEASE);
     rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
            (unsigned long long)(png_bytes >> 20), dir);
 }

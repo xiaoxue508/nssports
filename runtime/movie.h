@@ -21,13 +21,13 @@ extern const char *const movie_symbols[MOVIE_ENTRIES];
 // entry for decoders left to the library. Filled from the loaded modules at the first entry call, or by the probe.
 typedef struct {
     uint64_t signal_event, buf_set_range, buf_set_data, buf_base, buf_capacity;
-    uint64_t md_find_int32, md_find_string, md_set_int32, md_set_rect, md_set_string;
+    uint64_t md_find_int32, md_find_string, md_find_data, md_set_int32, md_set_rect, md_set_string;
     uint64_t vptr;
     uint64_t orig[MOVIE_ENTRIES];
 } MovieGuest;
 
 enum { MOVIE_EV_INPUT, MOVIE_EV_OUTPUT, MOVIE_EV_FORMAT, MOVIE_EV_ERROR };   // DecoderEvents: EventType * per event
-enum { MOVIE_TYPE_VP9 = 3, MOVIE_MODE_BUFFER = 1, MOVIE_FORMAT_NV12 = 4, MOVIE_FLAG_EOS = 4 };
+enum { MOVIE_TYPE_AVC = 1, MOVIE_TYPE_VP9 = 3, MOVIE_MODE_BUFFER = 1, MOVIE_FORMAT_NV12 = 4, MOVIE_FLAG_EOS = 4 };
 
 typedef struct { uint64_t frames, decode_ns, max_ns, errors, dropped, handed, fit_ns; } MovieStats;
 // fit_ns: the part of decode_ns spent writing the NV12 frame

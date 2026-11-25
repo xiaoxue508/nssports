@@ -3,10 +3,8 @@
 > **项目**：*Nintendo Switch Sports*（Title ID `0100D2F00D5C0000`，USA v0）Windows x86-64 静态重编译
 > **工作区**：`E:\nssports` ｜ **当前分支**：`opensport`（基线 `master` = `f7a84fc`）
 > **远程仓库**：`https://github.com/xiaoxue508/nssports`（public）
-> **当前产物**：`E:\nssports\build\v0\nssports.exe`（176.3 MiB，462 目标文件编译链接通过，0 错误）
+> **当前产物**：`E:\nssports\build\v0\nssports.exe`
 > **更新日期**：2026-11-25
-
-> **历史踩坑归档**：此前已排查过的图形渲染根因（预通道深度 `LESS_OR_EQUAL`、`2DArray` 立方体视图、`DrawElementsIndirect` 全零 / `NVN_STAGE_GS` 缺失等）及已证伪假设，已全部拆分至 [HISTORY_NOTES.md](HISTORY_NOTES.md)。**注意：该归档中除 Joy-Con 外的代码改动均已从当前分支移除，仅作经验与避坑参考，切勿误以为当前代码库仍包含那些补丁。**
 
 ---
 
@@ -31,36 +29,25 @@
 
 ---
 
-## 2. 当前代码库实际状态
+## 2. 当前代码库实际状态与已解决问题
 
-当前 `opensport` 分支相对于 `master`（`f7a84fc`）**仅包含两项提交**（本地与 `origin/opensport` 完全一致）：
-
-1. **Joy-Con (L) 蓝牙直连与单柄竖持镜像修复**（源自 `94b3575`，用户实机验证正常）：
-   - `runtime/input.c`：屏蔽 `joycon_driver_mode()==1` 下的 `057e:{2006,2007,2009}` 并关闭冲突的 SDL Joy-Con HIDAPI hints。
-   - `runtime/input_joycon_win.c`：补全 `STYLE_HANDHELD`、`gyro_scale` 选择、单柄镜像（`ZL↔ZR`、十字键↔`ABXY`、`L↔R`、`MINUS↔PLUS` 及摇杆）与振动回退。
-   - `runtime/ov_input.c`：按摇杆向量模长合并键鼠/手柄输入，`ov_hold_type()` 仅在模式变化时记日志。
-2. **本交接文档与历史归档**（`HANDOVER.md`、`HISTORY_NOTES.md`）。
-
-除此之外的所有历史改动均已回滚删除。
-
----
-
-## 3. 当前首要问题（最新编译实测）
-
-- **现象**：启动新编译的 `build\v0\nssports.exe`，可正常进入“请将腕带系在 Joy-Con 上”确认界面；**按下手柄“下一步”按钮后程序直接闪退**。
-- **日志直接死因**（已从 `E:\nssports\build\v0\logs\totk.1.log` 确认）：
-  ```text
-  [host] movie: decoder type 1 mode 1 format 4 left to the library (only VP9 in buffer mode runs on the host)
-  FATAL: svc #0x26 unknown at sdk+0x3ccf40: Break (the SDK aborted)
-  ```
-- **原因定位**：确认腕带界面点击“下一步”后，游戏立即启动开场视频解码（`decoder type 1 mode 1 format 4`，即 **H.264 / AVC** 视频格式）。当前基线 `f7a84fc`（源自 `totk-recomp`）的 `runtime/ov_movie.c` **只实现了 buffer 模式的 VP9**，遇到 H.264 时将其交给 guest `nn::movie` 库处理，而 guest 侧因缺少对应服务/实现直接触发 `svc #0x26 (Break)` 崩溃。
-- **环境提示**：构建链已默认链接 `-lopenh264` 且 `build\v0\libopenh264-8.dll` 已就绪（`tools/build_game.py` 的 `SDL3_DLLS` 与 `LINK_LIBS` 中均已配置），可直接在干净的 `runtime/ov_movie.c` + `runtime/movie.h` 中实现 H.264/AVC 解码以跨过开场视频。
+1. **Joy-Con (L) 蓝牙直连与单柄竖持镜像修复**（源自 `94b3575`，实机验证正常）：
+   - [input.c](runtime/input.c)：屏蔽 `joycon_driver_mode()==1` 下的 `057e:{2006,2007,2009}` 并关闭冲突的 SDL Joy-Con HIDAPI hints。
+   - [input_joycon_win.c](runtime/input_joycon_win.c)：补全 `STYLE_HANDHELD`、`gyro_scale` 选择、单柄镜像（`ZL↔ZR`、十字键↔`ABXY`、`L↔R`、`MINUS↔PLUS` 及摇杆）与振动回退。
+   - [ov_input.c](runtime/ov_input.c)：按摇杆向量模长合并键鼠/手柄输入，`ov_hold_type()` 仅在模式变化时记日志。
+2. **按腕带“下一步”进入 H.264 开场视频闪退（已解决闪退）**：
+   - [movie.h](runtime/movie.h)、[ov_movie.c](runtime/ov_movie.c)：补全主机侧 OpenH264（`decoder type 1 mode 1 format 4`）解码路径并移除 `Initialize()` 后的多线程设置崩溃，现可顺利跨过开场视频并稳定进入运动选择菜单。
+   - **遗留小问题**：`totk.log` 显示 `csd 0 bytes` / `ds=0x10`（开场视频当前解码 `0 frames`），可后续补齐 H.264 SPS/PPS 提取以正常显示开场动画画面。
+3. **运动选择界面（Spocco Square）3D 背景渲染错乱与黑屏挂起（已彻底解决，默认 `TOTK_MEMORY=auto` 实机验证完全正常）**：
+   - **Passthrough Geometry Shaders（`NVN_STAGE_GS = 2`）**：在 [vk.h](runtime/vk.h)、[vk_device.c](runtime/vk_device.c)、[gfx_shader.c](runtime/gfx_shader.c)、[vk_pipeline.c](runtime/vk_pipeline.c)、[vk_exec_draw.c](runtime/vk_exec_draw.c) 补全 `VK_NV_geometry_shader_passthrough` + `VK_NV_viewport_array2` 支持，使几何着色器剔除阶段（如 `pass 0003`）能向后续 `DrawElementsIndirect` 的间接命令缓冲区与索引缓冲区写入剔除后三角形。
+   - **无锁 16-bit 原子改写（[vk_pipeline.c](runtime/vk_pipeline.c)）**：将 Ryujinx 生成的 49 指令 `float`-bitcast `OpAtomicCompareExchange` 16-bit 索引写入 CAS 循环改写为 19 指令无循环无锁 `OpAtomicAnd` + `OpAtomicOr` 并为目标 SSBO 添加 `Coherent` 修饰。
+   - **间接命令头清零 VS 模拟（[gfx.h](runtime/gfx.h)、[gfx_shader.c](runtime/gfx_shader.c)、[vk_exec_draw.c](runtime/vk_exec_draw.c)）**：`pass 0000` 顶点着色器从 VS SSBO 0 读取 64 位地址并用全局内存写（`STG`）将约 310 个 `DrawIndexedIndirect` 命令头初始化为 `(0, 1, 0, 0, 0)`；由于地址并非直接来自 `c0` SSBO 槽位，Ryujinx `GlobalToStorage` 将其降级为空 `OpReturn`。现于反射阶段精确识别该着色器（`detect_indirect_clear_vs`），并在 `op_draw` 中通过 `try_indirect_clear_draw` 以批量 `vkCmdCopyBuffer`（配合 `VK_MEM_USE`、`vk_mem_gpu_wrote` 及前后 `vk_exec_barrier`）完成初始化。
+4. **F12 按需帧转储**：
+   - [input_win.c](runtime/input_win.c)、[vk_dump.c](runtime/vk_dump.c)、[vk_backend.c](runtime/vk_backend.c)、[vk_exec.h](runtime/vk_exec.h)、[vk_exec_draw.c](runtime/vk_exec_draw.c)：支持在游戏中按 `F12` 触发单帧 `passes.txt` + `images.txt` + PNG 转储（含 `gs` 与 `ind` 状态）。
 
 ---
 
-## 4. 建议推进顺序
+## 3. 后续可选工作
 
-1. **优先修复过场/开场视频闪退**：先查看 `runtime/ov_movie.c` 与 `runtime/movie.h`，补全 H.264 (`format 4` / `type 1`) 的主机解码路径（OpenH264），确认能顺利播完开场动画并稳定进入主菜单。
-2. **进入主菜单与 3D 球场后，再按优先级处理历史已定位的渲染问题**（详见 [HISTORY_NOTES.md](HISTORY_NOTES.md)）：
-   - 先复核并干净补回 `2DArray` 立方体视图兼容（6×N 层未压缩方形 2DArray）与 Z-prepass `LESS_OR_EQUAL`；
-   - 再针对 `DrawElementsIndirect` 全零导致的黑天空/黑球场/黑看台/黑角色问题，从头干净设计 `NVN_STAGE_GS`（Passthrough GS）实现，并规避此前“直接放行全量 GS 导致进入菜单全黑”的踩坑。
+1. **各运动项目实机验证**：在默认配置下进入排球、羽毛球、保龄球、足球、击剑、网球等具体运动，验证局内 3D 渲染、阴影/反射、帧率与稳定性。
+2. **H.264 开场视频画面补齐**：排查 [ov_movie.c](runtime/ov_movie.c) 中 `csd 0 bytes` / `ds=0x10` 的 SPS/PPS 传递问题，使开场动画视频可见播放。

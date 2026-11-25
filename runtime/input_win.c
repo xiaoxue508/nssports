@@ -211,6 +211,10 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
         break;
     case WM_KEYDOWN:   // Esc is unbound in the game layout: it releases the cursor and opens the menu (menu_window_msg)
         if (w == VK_ESCAPE && !(cur_rel & CUR_REL)) { cur_rel_update(rel_esc); cursor_update(h); }
+        if (w == VK_F12 && !(l & (1 << 30))) {
+            void vk_dump_trigger(void);
+            vk_dump_trigger();
+        }
         break;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:   // client area only; poll_merged drops the click
         if (cur_rel & CUR_REL) { cur_rel_update(rel_clear); cursor_update(h); }

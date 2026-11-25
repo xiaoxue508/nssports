@@ -58,9 +58,15 @@
 
 enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
        SPV_OP_TYPE_POINTER = 32, SPV_OP_CONSTANT = 43, SPV_OP_CONSTANT_COMPOSITE = 44,
-       SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_VARIABLE = 59,
-       SPV_OP_DECORATE = 71, SPV_DEC_BUILTIN = 11, SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
-       SPV_SC_OUTPUT = 3 };
+       SPV_OP_CONSTANT_NULL = 46, SPV_OP_FUNCTION = 54, SPV_OP_FUNCTION_PARAMETER = 55,
+       SPV_OP_FUNCTION_END = 56, SPV_OP_VARIABLE = 59, SPV_OP_LOAD = 61, SPV_OP_ACCESS_CHAIN = 65,
+       SPV_OP_DECORATE = 71, SPV_OP_BITCAST = 124, SPV_OP_SHR_LOGICAL = 194, SPV_OP_SHL = 196,
+       SPV_OP_BITWISE_AND = 199, SPV_OP_NOT = 200, SPV_OP_BITFIELD_INSERT = 201,
+       SPV_OP_ATOMIC_LOAD = 227, SPV_OP_ATOMIC_CAS = 230, SPV_OP_ATOMIC_AND = 240, SPV_OP_ATOMIC_OR = 241,
+       SPV_OP_LABEL = 248, SPV_OP_RETURN = 253,
+       SPV_DEC_BUFFER_BLOCK = 3, SPV_DEC_BUILTIN = 11, SPV_DEC_COHERENT = 23,
+       SPV_DEC_LOCATION = 30, SPV_DEC_INDEX = 32, SPV_DEC_BINDING = 33, SPV_DEC_DESCRIPTOR_SET = 34,
+       SPV_SC_UNIFORM = 2, SPV_SC_OUTPUT = 3, SPV_SC_STORAGE_BUFFER = 12 };
 
 #define MAX_BINDINGS 128
 #define PIPE_BUCKETS 4096
@@ -661,6 +667,244 @@ static uint32_t *spirv_rebind(const uint32_t *w, uint64_t n, uint32_t off) {
     return o;
 }
 
+static int spv_id_in(const uint32_t *a, int n, uint32_t id) {
+    for (int i = 0; i < n; i++)
+        if (a[i] == id) return 1;
+    return 0;
+}
+
+static int spv_fn_has_cas(const uint32_t *w, uint64_t n, uint64_t start) {
+    for (uint64_t i = start; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_ATOMIC_CAS && len == 9) return 1;
+        if (op == SPV_OP_FUNCTION_END) break;
+        i += len;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint64_t fn_start, fn_end, off0, off1, off2, off3;
+    uint32_t int_t, uint_t, ptr_u, ssbo, c0_i, c2, c3, c16_u, scope, sem;
+    uint32_t id[13];   // 13 distinct result IDs in the matched function body
+} SpvU16Cas;
+
+static int spv_is_zero_const(const uint32_t (*zc)[2], int nzc, uint32_t ty, uint32_t id) {
+    for (int i = 0; i < nzc; i++)
+        if (zc[i][0] == ty && zc[i][1] == id) return 1;
+    return 0;
+}
+
+static int spv_match_u16_cas_fn(const uint32_t *w, uint64_t n, uint64_t fn_start, const uint32_t *ssbo_vars, int nssbo,
+                                const uint32_t (*zc)[2], int nzc, SpvU16Cas *m) {
+    uint64_t off[50];
+    int nins = 0;
+    for (uint64_t i = fn_start; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n || nins >= 50) return 0;
+        off[nins++] = i;
+        i += len;
+        if (op == SPV_OP_FUNCTION_END) break;
+    }
+    if (nins != 49) return 0;
+    #define OP(k) (w[off[k]] & 0xffff)
+    #define LEN(k) (w[off[k]] >> 16)
+    #define ARG(k, j) (w[off[k] + (j)])
+    if (OP(0) != SPV_OP_FUNCTION || LEN(0) < 5 ||
+        OP(1) != SPV_OP_FUNCTION_PARAMETER || LEN(1) != 3 ||
+        OP(2) != SPV_OP_FUNCTION_PARAMETER || LEN(2) != 3 ||
+        OP(3) != SPV_OP_LABEL || LEN(3) != 2 ||
+        OP(7) != SPV_OP_LOAD || LEN(7) != 4 || ARG(7, 3) != ARG(1, 2) ||
+        OP(8) != SPV_OP_SHR_LOGICAL || LEN(8) != 5 ||
+        OP(18) != SPV_OP_ACCESS_CHAIN || LEN(18) != 6 || !spv_id_in(ssbo_vars, nssbo, ARG(18, 3)) ||
+        OP(19) != SPV_OP_LOAD || LEN(19) != 4 ||
+        OP(26) != SPV_OP_BITCAST || LEN(26) != 4 ||
+        OP(28) != SPV_OP_BITCAST || LEN(28) != 4 ||
+        OP(29) != SPV_OP_LOAD || LEN(29) != 4 || ARG(29, 3) != ARG(2, 2) ||
+        OP(30) != SPV_OP_BITCAST || LEN(30) != 4 ||
+        OP(32) != SPV_OP_BITWISE_AND || LEN(32) != 5 ||
+        OP(33) != SPV_OP_SHL || LEN(33) != 5 ||
+        OP(34) != SPV_OP_BITCAST || LEN(34) != 4 ||
+        OP(35) != SPV_OP_BITFIELD_INSERT || LEN(35) != 7 ||
+        OP(36) != SPV_OP_ATOMIC_CAS || LEN(36) != 9 || ARG(36, 1) != ARG(19, 1) ||
+        !spv_is_zero_const(zc, nzc, ARG(19, 1), ARG(36, 5)) ||
+        OP(47) != SPV_OP_RETURN || LEN(47) != 1 ||
+        OP(48) != SPV_OP_FUNCTION_END || LEN(48) != 1)
+        return 0;
+    m->fn_start = fn_start, m->fn_end = off[48] + 1;
+    m->off0 = off[0], m->off1 = off[1], m->off2 = off[2], m->off3 = off[3];
+    m->int_t = ARG(7, 1), m->uint_t = ARG(19, 1), m->ptr_u = ARG(18, 1);
+    m->ssbo = ARG(18, 3), m->c0_i = ARG(18, 4), m->c2 = ARG(8, 4), m->c3 = ARG(32, 4), m->c16_u = ARG(35, 6);
+    m->scope = ARG(36, 4), m->sem = ARG(36, 5);
+    m->id[0] = ARG(7, 2);   m->id[1] = ARG(8, 2);   m->id[2] = ARG(18, 2);  m->id[3] = ARG(29, 2);
+    m->id[4] = ARG(30, 2);  m->id[5] = ARG(32, 2);  m->id[6] = ARG(33, 2);  m->id[7] = ARG(34, 2);
+    m->id[8] = ARG(19, 2);  m->id[9] = ARG(26, 2);  m->id[10] = ARG(28, 2); m->id[11] = ARG(35, 2);
+    m->id[12] = ARG(36, 2);
+    #undef OP
+    #undef LEN
+    #undef ARG
+    return 1;
+}
+
+static uint64_t spv_emit_u16_atomic_fn(uint32_t *o, uint64_t p, const uint32_t *w, const SpvU16Cas *m) {
+    uint32_t l0 = w[m->off0] >> 16;
+    memcpy(o + p, w + m->off0, (size_t)l0 * 4); p += l0;
+    memcpy(o + p, w + m->off1, 3 * 4); p += 3;
+    memcpy(o + p, w + m->off2, 3 * 4); p += 3;
+    memcpy(o + p, w + m->off3, 2 * 4); p += 2;
+    #define E4(op, a, b, c)       do { o[p++] = 4u << 16 | (op); o[p++] = (a); o[p++] = (b); o[p++] = (c); } while (0)
+    #define E5(op, a, b, c, d)    do { o[p++] = 5u << 16 | (op); o[p++] = (a); o[p++] = (b); o[p++] = (c); o[p++] = (d); } while (0)
+    #define E6(op, a, b, c, d, e) do { o[p++] = 6u << 16 | (op); o[p++] = (a); o[p++] = (b); o[p++] = (c); o[p++] = (d); o[p++] = (e); } while (0)
+    #define E7(op, a, b, c, d, e, f) do { o[p++] = 7u << 16 | (op); o[p++] = (a); o[p++] = (b); o[p++] = (c); o[p++] = (d); o[p++] = (e); o[p++] = (f); } while (0)
+    E4(SPV_OP_LOAD, m->int_t, m->id[0], w[m->off1 + 2]);
+    E5(SPV_OP_SHR_LOGICAL, m->int_t, m->id[1], m->id[0], m->c2);
+    E6(SPV_OP_ACCESS_CHAIN, m->ptr_u, m->id[2], m->ssbo, m->c0_i, m->id[1]);
+    E4(SPV_OP_LOAD, m->int_t, m->id[3], w[m->off2 + 2]);
+    E4(SPV_OP_BITCAST, m->uint_t, m->id[4], m->id[3]);
+    E5(SPV_OP_BITWISE_AND, m->int_t, m->id[5], m->id[0], m->c3);
+    E5(SPV_OP_SHL, m->int_t, m->id[6], m->id[5], m->c3);
+    E4(SPV_OP_BITCAST, m->uint_t, m->id[7], m->id[6]);
+    E4(SPV_OP_NOT, m->uint_t, m->id[8], m->sem);
+    E7(SPV_OP_BITFIELD_INSERT, m->uint_t, m->id[9], m->id[8], m->sem, m->id[7], m->c16_u);
+    E7(SPV_OP_BITFIELD_INSERT, m->uint_t, m->id[10], m->sem, m->id[4], m->id[7], m->c16_u);
+    E7(SPV_OP_ATOMIC_AND, m->uint_t, m->id[11], m->id[2], m->scope, m->sem, m->id[9]);
+    E7(SPV_OP_ATOMIC_OR, m->uint_t, m->id[12], m->id[2], m->scope, m->sem, m->id[10]);
+    #undef E4
+    #undef E5
+    #undef E6
+    #undef E7
+    o[p++] = 1u << 16 | SPV_OP_RETURN;
+    o[p++] = 1u << 16 | SPV_OP_FUNCTION_END;
+    return p;
+}
+
+// Rewrites GS 16-bit CAS loops to wait-free OpAtomicAnd+OpAtomicOr (with Coherent+OpAtomicLoad fallback).
+static uint32_t *spirv_fix_cas_coherent(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    uint32_t bblock[64], coh_ids[64], ssbo_ptrs[64], ssbo_vars[32], zc[32][2];
+    int nbblock = 0, ncoh = 0, nssbo_ptrs = 0, nssbo = 0, nzc = 0;
+    uint64_t dec_end = 0;
+    int has_cas = 0;
+    uint32_t cas_type = 0, cas_scope = 0, cas_sem = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == 71 || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633)
+            dec_end = i + len;
+        if (op == SPV_OP_DECORATE && len >= 3) {
+            if (w[i + 2] == SPV_DEC_BUFFER_BLOCK && nbblock < 64) bblock[nbblock++] = w[i + 1];
+            else if (w[i + 2] == SPV_DEC_COHERENT && ncoh < 64) coh_ids[ncoh++] = w[i + 1];
+        } else if (op == SPV_OP_TYPE_POINTER && len >= 4) {
+            if ((w[i + 2] == SPV_SC_STORAGE_BUFFER ||
+                 (w[i + 2] == SPV_SC_UNIFORM && spv_id_in(bblock, nbblock, w[i + 3]))) &&
+                nssbo_ptrs < 64)
+                ssbo_ptrs[nssbo_ptrs++] = w[i + 1];
+        } else if (op == SPV_OP_CONSTANT && len == 4 && w[i + 3] == 0 && nzc < 32) {
+            zc[nzc][0] = w[i + 1], zc[nzc][1] = w[i + 2], nzc++;
+        } else if (op == SPV_OP_VARIABLE && len >= 4) {
+            if (spv_id_in(ssbo_ptrs, nssbo_ptrs, w[i + 1]) && nssbo < 32) ssbo_vars[nssbo++] = w[i + 2];
+        } else if (op == SPV_OP_ATOMIC_CAS && len == 9) {
+            has_cas = 1, cas_type = w[i + 1], cas_scope = w[i + 4], cas_sem = w[i + 5];
+        }
+        i += len;
+    }
+    if (!has_cas || !nssbo || !dec_end) return NULL;
+    int add_coh = 0, n_loads = 0, n_u16 = 0;
+    for (int k = 0; k < nssbo; k++)
+        if (!spv_id_in(coh_ids, ncoh, ssbo_vars[k])) add_coh++;
+    SpvU16Cas u16[8];
+    uint32_t ac_ptrs[64];
+    int nac = 0, in_cas_fn = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_FUNCTION) {
+            if (n_u16 < 8 && spv_match_u16_cas_fn(w, n, i, ssbo_vars, nssbo, zc, nzc, &u16[n_u16])) {
+                i = u16[n_u16++].fn_end;
+                in_cas_fn = 0;
+                continue;
+            }
+            in_cas_fn = spv_fn_has_cas(w, n, i);
+            nac = 0;
+        } else if (op == SPV_OP_FUNCTION_END) {
+            in_cas_fn = 0;
+        } else if (in_cas_fn && op == SPV_OP_ACCESS_CHAIN && len >= 4 && spv_id_in(ssbo_vars, nssbo, w[i + 3])) {
+            if (nac < 64) ac_ptrs[nac++] = w[i + 2];
+        } else if (in_cas_fn && op == SPV_OP_LOAD && len == 4 && w[i + 1] == cas_type &&
+                   spv_id_in(ac_ptrs, nac, w[i + 3])) {
+            n_loads++;
+        }
+        i += len;
+    }
+    if (!add_coh && !n_loads && !n_u16) return NULL;
+    int64_t delta = (int64_t)add_coh * 3 + (int64_t)n_loads * 2;
+    for (int k = 0; k < n_u16; k++) {
+        uint64_t new_fn = (uint64_t)(w[u16[k].off0] >> 16) + 79;
+        delta += (int64_t)new_fn - (int64_t)(u16[k].fn_end - u16[k].fn_start);
+    }
+    uint64_t new_n = (uint64_t)((int64_t)n + delta);
+    uint32_t *o = malloc(new_n * 4);
+    if (!o) return NULL;
+    memcpy(o, w, 5 * 4);
+    uint64_t p = 5;
+    nac = 0, in_cas_fn = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_FUNCTION) {
+            int matched = -1;
+            for (int k = 0; k < n_u16; k++)
+                if (u16[k].fn_start == i) { matched = k; break; }
+            if (matched >= 0) {
+                p = spv_emit_u16_atomic_fn(o, p, w, &u16[matched]);
+                i = u16[matched].fn_end;
+                in_cas_fn = 0;
+                continue;
+            }
+            in_cas_fn = spv_fn_has_cas(w, n, i);
+            nac = 0;
+        } else if (op == SPV_OP_FUNCTION_END) {
+            in_cas_fn = 0;
+        } else if (in_cas_fn && op == SPV_OP_ACCESS_CHAIN && len >= 4 && spv_id_in(ssbo_vars, nssbo, w[i + 3])) {
+            if (nac < 64) ac_ptrs[nac++] = w[i + 2];
+        }
+        if (in_cas_fn && op == SPV_OP_LOAD && len == 4 && w[i + 1] == cas_type && spv_id_in(ac_ptrs, nac, w[i + 3])) {
+            o[p++] = 6u << 16 | SPV_OP_ATOMIC_LOAD;
+            o[p++] = w[i + 1];
+            o[p++] = w[i + 2];
+            o[p++] = w[i + 3];
+            o[p++] = cas_scope;
+            o[p++] = cas_sem;
+        } else {
+            memcpy(o + p, w + i, (size_t)len * 4);
+            p += len;
+        }
+        if (i + len == dec_end) {
+            for (int k = 0; k < nssbo; k++) {
+                if (!spv_id_in(coh_ids, ncoh, ssbo_vars[k])) {
+                    o[p++] = 3u << 16 | SPV_OP_DECORATE;
+                    o[p++] = ssbo_vars[k];
+                    o[p++] = SPV_DEC_COHERENT;
+                }
+            }
+        }
+        i += len;
+    }
+    if (p != new_n) {
+        LOG_ONCE("vk_pipeline: spirv_fix_cas_coherent size mismatch (p=%llu new_n=%llu)",
+                 (unsigned long long)p, (unsigned long long)new_n);
+        free(o);
+        return NULL;
+    }
+    *out_n = p;
+    if (n_u16)
+        LOG_ONCE("vk_pipeline: rewrote GS 16-bit CAS loop to wait-free OpAtomicAnd+OpAtomicOr (ssbo=%d, fns=%d)",
+                 add_coh, n_u16);
+    else
+        LOG_ONCE("vk_pipeline: patched GS CAS loop to Coherent + OpAtomicLoad (ssbo=%d, loads=%d)", add_coh, n_loads);
+    return o;
+}
+
 // DescriptorSet decorations become set (the fragment stage's resources move to set 1 with independent layouts).
 static uint32_t *spirv_set(const uint32_t *w, uint64_t n, uint32_t set) {
     uint32_t *o = malloc(n * 4);
@@ -674,6 +918,7 @@ static uint32_t *spirv_set(const uint32_t *w, uint64_t n, uint32_t set) {
     }
     return o;
 }
+
 
 // Dual-source blending (docs/maxwell.md 5.6): SRC1 blend factors read the fragment shader's colour output 1,
 // which Vulkan takes from Location 0, Index 1. The Output variable at Location 1 moves there, as Ryujinx declares it
@@ -706,6 +951,7 @@ static uint32_t *spirv_dual_source(const uint32_t *w, uint64_t n, uint64_t *out_
     *out_n = n + 4;
     return o;
 }
+
 
 // Adds an Output variable for each Location of `missing` (type and width from io) to a module, declared in the entry
 // point interface and initialised as Maxwell reads an unwritten output: (0, 0, 0, 1), the w as the bits of 1.0f whatever
@@ -797,6 +1043,7 @@ static uint32_t *spirv_add_outputs(const uint32_t *w, uint64_t n, uint32_t missi
     return o;
 }
 
+
 // Two fixes for what the translator declares but a shader does not use (NULL: nothing to change):
 //  - the fragment shader interlock capability and extension, which Ryujinx adds to every fragment shader when the host
 //    reports interlock support (SpirvGenerator.cs) and vk_device.c does not enable; kept when the shader interlocks;
@@ -873,6 +1120,7 @@ out:
     return o;
 }
 
+
 // Discard with demote semantics (docs/maxwell.md 3.5). Maxwell's KIL keeps the fragment running as a helper, so the
 // derivatives its 2x2 quad takes afterwards stay defined; the translator emits OpKill, which ends the invocation, and
 // what the quad's other fragments then get from an implicit derivative (OpImageQueryLod, implicit-LOD samples, dFdx) is
@@ -945,6 +1193,7 @@ static uint32_t *spirv_demote(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     return o;
 }
 
+
 // True when the module declares a GroupNonUniform* or SubgroupBallot-style capability (lane masks assume 32 lanes).
 static int uses_subgroup_ops(const uint32_t *w, uint64_t words) {
     for (uint64_t i = 5; i < words;) {
@@ -1003,8 +1252,8 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 }
 
 static VkShaderStageFlags stage_bit(int stage) {
-    return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
-                                                                                      : VK_SHADER_STAGE_COMPUTE_BIT;
+    return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_GS ? VK_SHADER_STAGE_GEOMETRY_BIT
+         : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
 // One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
@@ -1063,11 +1312,15 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
     return -1;
 }
 
-// Checks both stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
-static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off, char *why, size_t cap) {
+// Checks all stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
+static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t gs_off, uint32_t fs_off, char *why, size_t cap) {
     uint32_t nv = l->set1 ? l->n0 : l->n;
     int m = module_binding_missing(s->vs, l->b, nv, 0);
     const char *stage = "vertex";
+    if (m < 0 && s->gs) {
+        m = module_binding_missing(s->gs, l->b, l->n, gs_off);
+        stage = "geometry";
+    }
     if (m < 0 && s->fs) {
         m = l->set1 ? module_binding_missing(s->fs, l->b + l->n0, l->n - l->n0, 0) : module_binding_missing(s->fs, l->b, l->n, fs_off);
         stage = "fragment";
@@ -1294,7 +1547,7 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
 // ---- graphics pipelines
 
 typedef struct {                       // normalized: zero where the state is dynamic or unused
-    const GfxShader *vs, *fs;
+    const GfxShader *vs, *gs, *fs;
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
@@ -1352,8 +1605,8 @@ uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i) { return target_w
 
 static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
-    k->vs = s->vs, k->fs = s->fs;
-    k->indep = (uint8_t)P.indep;
+    k->vs = s->vs, k->gs = s->gs, k->fs = s->fs;
+    k->indep = (uint8_t)(P.indep && !s->gs);
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
     int d, st;
@@ -1416,12 +1669,12 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
-static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
-    VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
-    uint64_t vw, fw;
+static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t gs_off, uint32_t fs_off) {
+    VkShaderModule vm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+    uint64_t vw, gw = 0, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
-    uint32_t *vpatched = NULL, *fpatched = NULL;
-    if (l->set1) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
+    uint32_t *vpatched = NULL, *gpatched = NULL, *fpatched = NULL;
+    if (l->set1 && !s->gs) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
         if (missing) {
@@ -1429,6 +1682,19 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
             else vcode = vpatched, vw = n2;
+        }
+    }
+    if (s->gs) {
+        const uint32_t *gcode = gfx_shader_spirv(s->gs, &gw);
+        if (gcode) {
+            uint64_t gw2 = 0;
+            uint32_t *gcoh = spirv_fix_cas_coherent(gcode, gw, &gw2);
+            if (gcoh) gpatched = gcoh, gcode = gpatched, gw = gw2;
+            if (gs_off) {
+                uint32_t *gr = spirv_rebind(gcode, gw, gs_off);
+                if (gr) { free(gpatched); gpatched = gr; gcode = gr; }
+            }
+            gm = make_module(gcode, gw);
         }
     }
     if (s->fs) {
@@ -1440,7 +1706,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             else if (vout[i].type != fin[i].type)
                 LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
         }
-        if (missing && !l->set1) {
+        if (missing && !l->set1 && !s->gs) {
             uint64_t n2 = 0;
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
@@ -1462,18 +1728,28 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (fcode) fm = make_module(fcode, fw);
     }
     vm = make_module(vcode, vw);
-    free(vpatched), free(fpatched);
+    free(vpatched), free(gpatched), free(fpatched);
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!vm || (s->fs && !fm)) goto out;
+    if (!vm || (s->gs && !gm) || (s->fs && !fm)) goto out;
 
-    VkPipelineShaderStageCreateInfo stages[2] = {
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"},
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"}};
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqf;
+    VkPipelineShaderStageCreateInfo stages[3];
+    uint32_t nstages = 0;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqv, rqg, rqf;
     uint64_t sw;
     const uint32_t *scode = gfx_shader_spirv(s->vs, &sw);   // vcode may be a patched copy that is freed by now
-    pin_subgroup32(&stages[0], &rqv, scode, sw);
-    if (s->fs) pin_subgroup32(&stages[1], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
+    stages[nstages] = (VkPipelineShaderStageCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vm, .pName = "main"};
+    pin_subgroup32(&stages[nstages++], &rqv, scode, sw);
+    if (s->gs) {
+        stages[nstages] = (VkPipelineShaderStageCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_GEOMETRY_BIT, .module = gm, .pName = "main"};
+        pin_subgroup32(&stages[nstages++], &rqg, gfx_shader_spirv(s->gs, &sw), sw);
+    }
+    if (s->fs) {
+        stages[nstages] = (VkPipelineShaderStageCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"};
+        pin_subgroup32(&stages[nstages++], &rqf, gfx_shader_spirv(s->fs, &sw), sw);
+    }
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     uint32_t na = 0, nb = 0;
@@ -1526,7 +1802,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
-                                       .stageCount = s->fs ? 2 : 1, .pStages = stages, .pVertexInputState = &vi,
+                                       .stageCount = nstages, .pStages = stages, .pVertexInputState = &vi,
                                        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
                                        .pDynamicState = &dy, .layout = l->layout};
@@ -1545,6 +1821,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
 out:
     if (vm) vkDestroyShaderModule(P.device, vm, NULL);
+    if (gm) vkDestroyShaderModule(P.device, gm, NULL);
     if (fm) vkDestroyShaderModule(P.device, fm, NULL);
     return pipe;
 }
@@ -1911,7 +2188,7 @@ typedef struct Job {
     struct Job *next, *prev;           // prev: low queue only
     Pipe *p;
     const Layout *l;
-    uint32_t fs_off;
+    uint32_t gs_off, fs_off;
     uint8_t low;                       // in the low queue, or running at below-normal priority
     uint8_t prebuild, demanded;        // from the key file; a draw asked for it before it was ready
     int worker;                        // running on A.thread[worker]; -1 queued
@@ -2132,7 +2409,7 @@ static void pipe_worker(void *arg) {
         }
         // Step 1 for a job a draw waits for: its stage libraries and the fast link. Step 2, the optimised build, goes to
         // the head of the low queue, so a burst of new pipelines gets every fast link before any optimised build.
-        if (P.gpl && (!j->prebuild || j->demanded) && !j->p->info.pipeline && !j->p->fast_tried && j->p->lay) {
+        if (P.gpl && !j->s.gs && (!j->prebuild || j->demanded) && !j->p->info.pipeline && !j->p->fast_tried && j->p->lay) {
             int final;
             VkPipeline f = gpl_link(&j->s, &j->k, j->p->lay, 1, &final);   // releases P.lock while building
             j->p->fast_tried = 1;
@@ -2151,7 +2428,7 @@ static void pipe_worker(void *arg) {
             }
         }
         plat_mutex_unlock(&P.lock);
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->gs_off, j->fs_off);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
@@ -2159,7 +2436,7 @@ static void pipe_worker(void *arg) {
         j->p->job = NULL;
         if (pipe) {
             P.stats.graphics++, P.stats.async_built++;
-            if (!j->prebuild) keys_note(&j->s);
+            if (!j->prebuild && !j->s.gs) keys_note(&j->s);
         } else {
             P.stats.failures++;
             rt_log("vk_pipeline: graphics pipeline not built: pipeline creation failed");
@@ -2253,23 +2530,36 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     const char *why = NULL;
     Bindings B = {0};
     Layout *l = NULL;
-    uint32_t span = binding_span(s->vs);
-    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
+    uint32_t span = binding_span(s->vs), gs_off = 0, fs_off = 0;
+    int indep = P.indep && !s->gs;
+    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->gs && gfx_shader_stage(s->gs) != GFX_STAGE_GS) ||
+        (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS))
+        why = "stage mismatch";
     else if (k->topo_class == 3) why = "patches need tessellation stages, which are not translated";
-    else if (P.indep) {
+    else if (indep) {
         Bindings F = {0};
         if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&F, s->fs, 0))) why = "too many bindings";
         else if (!(l = layout_pair(&B, &F))) why = "descriptor layout creation failed";
-        span = 1;
-    } else if (!add_stage(&B, s->vs, 0) || (s->fs && !add_stage(&B, s->fs, span - 1))) why = "too many bindings";
-    else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+    } else {
+        if (!add_stage(&B, s->vs, 0)) why = "too many bindings";
+        if (!why && s->gs) {
+            gs_off = span - 1;
+            if (!add_stage(&B, s->gs, gs_off)) why = "too many bindings";
+            else span += binding_span(s->gs) - 1;
+        }
+        if (!why && s->fs) {
+            fs_off = span - 1;
+            if (!add_stage(&B, s->fs, fs_off)) why = "too many bindings";
+        }
+        if (!why && !(l = layout_get(&B))) why = "descriptor layout creation failed";
+    }
     char lack[128];
-    if (!why && !layout_covers(s, l, span - 1, lack, sizeof lack)) why = lack, l = NULL;
+    if (!why && !layout_covers(s, l, gs_off, fs_off, lack, sizeof lack)) why = lack, l = NULL;
     VkPipeline pipe = VK_NULL_HANDLE;
     Job *j = NULL;
     if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
-        *j = (Job){.l = l, .fs_off = span - 1, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
-    } else if (!why && !(pipe = create_graphics(s, k, l, span - 1))) {
+        *j = (Job){.l = l, .gs_off = gs_off, .fs_off = fs_off, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
+    } else if (!why && !(pipe = create_graphics(s, k, l, gs_off, fs_off))) {
         why = "pipeline creation failed";
     }
     if (why) {
@@ -2277,7 +2567,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         rt_log("vk_pipeline: graphics pipeline not built: %s", why);
     } else if (!j) {
         P.stats.graphics++;
-        if (mode != 2) keys_note(s);
+        if (mode != 2 && !s->gs) keys_note(s);
     }
     Pipe *p = pipe_add(k, sizeof *k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, gfx_shader_inputs(s->vs, NULL));
     if (!j || !p) {
@@ -2402,7 +2692,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                       : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
     }
     double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay) {
+    if (p && p->building && P.gpl && !s->gs && !p->info.pipeline && !p->fast_tried && p->lay) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
@@ -2476,7 +2766,7 @@ static void warm_builder(void *arg) {
         j->next = j->prev = NULL;
         j->low = 0;                    // not on a pool thread: promote() has nothing to raise
         plat_mutex_unlock(&P.lock);
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
+        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->gs_off, j->fs_off);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
@@ -2715,7 +3005,7 @@ static void gpu_key(char *out, size_t n) {   // vendor:device:driver version, as
 }
 
 static const char *stage_name(int st) {
-    return st == GFX_STAGE_VS ? "vertex" : st == GFX_STAGE_FS ? "fragment" : st == GFX_STAGE_CS ? "compute" : "other";
+    return st == GFX_STAGE_VS ? "vertex" : st == GFX_STAGE_GS ? "geometry" : st == GFX_STAGE_FS ? "fragment" : st == GFX_STAGE_CS ? "compute" : "other";
 }
 
 static int hex_digit(int c) {

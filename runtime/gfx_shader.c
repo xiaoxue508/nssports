@@ -87,6 +87,7 @@ struct GfxShader {
     GfxShaderIo in[32], out[32];
     uint32_t local[3];
     uint32_t mvprev_banks;                                 // .res.json "mvprev_banks" (patch 0015), 0 none
+    uint8_t indirect_clear;                                // VS: indirect-command-header initializer (empty STG stub)
 };
 
 static PlatMutex cache_lock = PLAT_MUTEX_INIT;                  // memory cache
@@ -544,7 +545,7 @@ static int reflection_valid(const char *res, uint64_t size) {
     const char *st = strstr(b, "\"stage\"");
     if (!st) return 0;
     st = strchr(st + 7, '"');
-    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
+    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"gs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -841,12 +842,83 @@ out:
     free(cc);
 }
 
+static int id_in(const uint32_t *arr, int n, uint32_t id) {
+    for (int i = 0; i < n; i++)
+        if (arr[i] == id) return 1;
+    return 0;
+}
+
+static void detect_indirect_clear_vs(GfxShader *s) {
+    if (s->stage != GFX_STAGE_VS || s->nres[GFX_RES_SSBO] != 1 || s->res[GFX_RES_SSBO][0].slot != 0 ||
+        s->res[GFX_RES_SSBO][0].flags != 0 || s->nres[GFX_RES_TEX] != 0 || s->nres[GFX_RES_IMG] != 0 ||
+        s->words < 5)
+        return;
+    enum { OP_INT = 21, OP_CONST = 43, OP_CNULL = 46, OP_FN = 54, OP_FNP = 55, OP_FNEND = 56, OP_FNCALL = 57,
+           OP_STORE = 62, OP_LABEL = 248, OP_RET = 253 };
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words;
+    uint32_t int_ty[4] = {0}, zero_ids[8] = {0}, one_ids[8] = {0}, empty_fn = 0;
+    int n_int = 0, n_zero = 0, n_one = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffffu, len = w[i] >> 16;
+        if (!len || i + len > n) return;
+        if (op == OP_INT && len >= 4 && w[i + 2] == 32 && n_int < 4) int_ty[n_int++] = w[i + 1];
+        else if (op == OP_CONST && len == 4 && id_in(int_ty, n_int, w[i + 1])) {
+            if (w[i + 3] == 0 && n_zero < 8) zero_ids[n_zero++] = w[i + 2];
+            else if (w[i + 3] == 1 && n_one < 8) one_ids[n_one++] = w[i + 2];
+        } else if (op == OP_CNULL && len == 3 && id_in(int_ty, n_int, w[i + 1]) && n_zero < 8) {
+            zero_ids[n_zero++] = w[i + 2];
+        } else if (op == OP_FN && len == 5 && !empty_fn) {
+            uint64_t j = i + len;
+            int pc = 0;
+            while (j < n && (w[j] & 0xffffu) == OP_FNP && (w[j] >> 16) > 0) {
+                pc++;
+                j += w[j] >> 16;
+            }
+            if (pc == 3 && j < n && (w[j] & 0xffffu) == OP_LABEL && (w[j] >> 16) > 0) {
+                j += w[j] >> 16;
+                if (j < n && (w[j] & 0xffffu) == OP_RET && (w[j] >> 16) > 0) {
+                    j += w[j] >> 16;
+                    if (j < n && (w[j] & 0xffffu) == OP_FNEND) empty_fn = w[i + 2];
+                }
+            }
+        }
+        i += len;
+    }
+    if (!empty_fn) return;
+    int prev_is_store = 0, n_calls = 0, c_one = 0, c_zero = 0, c_other = 0;
+    uint32_t prev_ptr = 0, prev_obj = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffffu, len = w[i] >> 16;
+        if (op == OP_FNCALL && len == 7 && w[i + 3] == empty_fn) {
+            if (prev_is_store && prev_ptr == w[i + 6]) {
+                if (id_in(one_ids, n_one, prev_obj)) c_one++;
+                else if (id_in(zero_ids, n_zero, prev_obj)) c_zero++;
+                else c_other++;
+            } else {
+                c_other++;
+            }
+            n_calls++;
+            prev_is_store = 0;
+        } else if (op == OP_STORE && len >= 3) {
+            prev_is_store = 1, prev_ptr = w[i + 1], prev_obj = w[i + 2];
+        } else {
+            prev_is_store = 0;
+        }
+        i += len;
+    }
+    if (n_calls == 5 && c_one == 1 && c_zero == 4 && c_other == 0) {
+        s->indirect_clear = 1;
+        rt_log("gfx_shader: detected indirect-clear VS (emulated via GPU buffer copy)");
+    }
+}
+
 static void reflect(GfxShader *s) {
     static const char *const kinds[GFX_RES_KINDS] = {"cbufs", "sbufs", "textures", "images"};
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : !strcmp(stage, "gs") ? GFX_STAGE_GS : GFX_STAGE_VS;
     s->mvprev_banks = (uint32_t)json_int(js, js + strlen(js), "mvprev_banks", 0);
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
@@ -855,6 +927,7 @@ static void reflect(GfxShader *s) {
     }
     reflect_spirv(s);
     patch_txd_transpose(s);
+    detect_indirect_clear_vs(s);
 }
 
 // ---- use masks (see the cache key at the top)
@@ -1240,7 +1313,7 @@ typedef struct {
 
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_GS ? "gs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     uint32_t c1_off;
     memcpy(&c1_off, control + 0x700, 4), memcpy(&r->length, control + 0x704, 4);
@@ -1749,6 +1822,8 @@ uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]) {
 }
 
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local, s->local, sizeof s->local); }
+
+int gfx_shader_is_indirect_clear(const GfxShader *s) { return s ? s->indirect_clear : 0; }
 
 // ---- answers met in play
 // The translated-shader key includes the answers a draw's state implies, so a translation made without play (the
