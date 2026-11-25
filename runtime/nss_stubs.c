@@ -14,6 +14,7 @@
 #include "gameplay_tweaks.h"
 #include "gfx.h"
 #include "host.h"
+#include "ov.h"
 #include "input.h"
 #include "mods.h"
 #include "nfp.h"
@@ -179,11 +180,9 @@ int res_dlss_dll(void) { return 0; }
 void res_fn_hit(uint64_t addr, uint64_t x0) { (void)addr; (void)x0; }
 void res_present(Cpu *c) { (void)c; }
 void res_wanted(unsigned out[2]) {
-    unsigned w = 1920, h = 1080;
-    const char *v = cfg_value("TOTK_OUTPUT_RES");
-    if (v && sscanf(v, "%ux%u", &w, &h) == 2 && w && h) {
-        out[0] = w;
-        out[1] = h;
+    if (ov_handheld()) {
+        out[0] = 1280;
+        out[1] = 720;
     } else {
         out[0] = 1920;
         out[1] = 1080;
@@ -193,8 +192,20 @@ void res_asked(unsigned out[2]) { res_wanted(out); }
 void res_sizes(unsigned out[2], unsigned scene[2]) {
     res_wanted(out);
     if (scene) {
-        scene[0] = out[0];
-        scene[1] = out[1];
+        const char *v = cfg_value("TOTK_RENDER_SCALE");
+        int pct = v && strcmp(v, "game") ? atoi(v) : 100;
+        if (pct == 67) {
+            scene[0] = (out[0] * 2u) / 3u;
+            scene[1] = (out[1] * 2u) / 3u;
+        } else if (pct >= 50 && pct <= 200) {
+            scene[0] = (out[0] * (unsigned)pct + 50u) / 100u;
+            scene[1] = (out[1] * (unsigned)pct + 50u) / 100u;
+        } else {
+            scene[0] = out[0];
+            scene[1] = out[1];
+        }
+        if (scene[0] < 1u) scene[0] = 1u;
+        if (scene[1] < 1u) scene[1] = 1u;
     }
 }
 int res_is_16x9(unsigned w, unsigned h) {

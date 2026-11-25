@@ -493,9 +493,7 @@ typedef struct {
     uint8_t fb_usage;              // created with ATTACHMENT_FEEDBACK_LOOP usage (VK_FEEDBACK_LAYOUT, attachable images)
     uint8_t fb_learned;            // a draw sampled it while it was a written attachment of the open pass: its passes
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin)
-    uint8_t scale;                 // 1, or TOTK_SHADOW_SCALE for a shadow map made larger than the game's (vk_texture.c
-                                   // shadow_scale_of): width and height above are the larger ones, the game's regions
-                                   // are multiplied by it
+    float scale;                   // 1, TOTK_SHADOW_SCALE, or TOTK_RENDER_SCALE: width and height above are scaled
     uint8_t gone;                  // the entry was dropped (vk_texture.c destroy_tex, under the texture lock): image and
                                    // record live until the submission being recorded is done, and nothing may be cached
                                    // by its image handle, which the driver can hand out again after that

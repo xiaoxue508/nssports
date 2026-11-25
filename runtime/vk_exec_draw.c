@@ -2095,7 +2095,7 @@ static void pcss_cascades(const VkExec *ex, float out[8]);
 
 // What support_fill reads: viewport size, point size, and the soft shadows' per-cascade factors (pcss_cascades).
 static void support_in(const VkExec *ex, float in[SUP_IN]) {
-    float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
+    float k = ex->pass_scale > 0.0f ? ex->pass_scale : 1.0f;
     in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] * k : (float)ex->pass_w;
     in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] * k : (float)ex->pass_h;
     in[2] = ex->point_size > 0 ? ex->point_size : 1.0f;
@@ -2893,7 +2893,7 @@ static void bind_pipeline(VkExec *ex, VkPipelineBindPoint bp, VkPipeline p) {
 static VkViewport draw_viewport(VkExec *ex) {
     float x = 0, y = 0, w = (float)ex->pass_w, h = (float)ex->pass_h;
     if (ex->has_vp) {
-        float k = ex->pass_scale > 1 ? (float)ex->pass_scale : 1.0f;
+        float k = ex->pass_scale > 0.0f ? ex->pass_scale : 1.0f;
         x = ex->vp[0][0] * k, y = ex->vp[0][1] * k, w = ex->vp[0][2] * k, h = ex->vp[0][3] * k;
     }
     if (w < 1) w = 1;

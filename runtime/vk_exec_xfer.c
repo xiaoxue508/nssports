@@ -367,11 +367,15 @@ static int sub_resolve(const tex_t *t, const view_t *v, int has_v, const NVNcopy
     s->level = has_v && v->set_levels ? v->base_level : 0;
     s->layer0 = has_v && v->set_layers ? v->min_layer : 0;
     uint32_t lw = max1(img->width >> s->level), lh = max1(img->height >> s->level);
-    int k = img->scale > 1 ? img->scale : 1;   // a larger shadow map: the game's region in its texels
-    s->x = r->xoffset * k, s->y = r->yoffset * k, s->z = r->zoffset;
+    float k = img->scale > 0.0f ? img->scale : 1.0f;   // scaled shadow map or 3D render target
+    s->x = k != 1.0f ? (int32_t)llroundf((float)r->xoffset * k) : r->xoffset;
+    s->y = k != 1.0f ? (int32_t)llroundf((float)r->yoffset * k) : r->yoffset;
+    s->z = r->zoffset;
     s->nz = r->depth > 0 ? (uint32_t)r->depth : 1;
-    s->w = r->width > 0 ? (uint32_t)r->width * k : defaults_to_level ? (s->x < (int32_t)lw ? lw - (uint32_t)s->x : 0) : 0;
-    s->h = r->height > 0 ? (uint32_t)r->height * k : defaults_to_level ? (s->y < (int32_t)lh ? lh - (uint32_t)s->y : 0) : 0;
+    s->w = r->width > 0 ? (k != 1.0f ? max1((uint32_t)lroundf((float)r->width * k)) : (uint32_t)r->width)
+                        : defaults_to_level ? (s->x < (int32_t)lw ? lw - (uint32_t)s->x : 0) : 0;
+    s->h = r->height > 0 ? (k != 1.0f ? max1((uint32_t)lroundf((float)r->height * k)) : (uint32_t)r->height)
+                         : defaults_to_level ? (s->y < (int32_t)lh ? lh - (uint32_t)s->y : 0) : 0;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t layers = is3d ? 1 : (uint32_t)s->z + s->nz, first = is3d ? 0 : s->layer0;
     if (s->level >= img->levels || s->x < 0 || s->y < 0 || s->z < 0 || !s->w || !s->h ||
@@ -427,7 +431,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
-    if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
+    if (s.img->scale != 1.0f) {   // the buffer holds the game's texel count, the image is scaled
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by TOTK_SHADOW_SCALE: skipped");
         return;
     }

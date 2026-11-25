@@ -369,6 +369,38 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
     return d->width * (uint32_t)scale <= most ? scale : 1;
 }
 
+static float scene_render_scale(void) {
+    static float s = -1.0f;
+    if (s < 0.0f) {
+        const char *v = cfg_value("TOTK_RENDER_SCALE");
+        int pct = v && strcmp(v, "game") ? atoi(v) : 100;
+        if (pct == 67) s = 2.0f / 3.0f;
+        else if (pct >= 50 && pct <= 200) s = (float)pct / 100.0f;
+        else s = 1.0f;
+        if (s != 1.0f) rt_log("vk: 3D render scale %.0f%% (TOTK_RENDER_SCALE=%s)", (double)(s * 100.0f), v ? v : "game");
+    }
+    return s;
+}
+
+static float scene_scale_of(uint64_t addr, const nvn_texdesc *d, const TexVkFormat *f, int mirrored) {
+    float scale = scene_render_scale();
+    if (scale == 1.0f || mirrored || !nvn_gpu_only(addr)) return 1.0f;
+    if (d->format == NVN_FORMAT_RGBA8_SRGB) return 1.0f; // Keep final swapchain texture at native game size
+    if (d->target != NVN_TEXTURE_TARGET_2D && d->target != NVN_TEXTURE_TARGET_2D_ARRAY &&
+        d->target != NVN_TEXTURE_TARGET_2D_MULTISAMPLE)
+        return 1.0f;
+    if (!f->depth && !f->stencil && d->format == NVN_FORMAT_RGBA8 && d->width == 1920 && d->height == 1080) {
+        // Keep CPU/indirect-clear or display-like rgba8 at 1x if needed, or scale render targets
+    }
+    if (d->width < 30 || d->height < 17) return 1.0f;
+    int diff = (int)d->width * 9 - (int)d->height * 16;
+    if (diff < 0) diff = -diff;
+    if (diff > (int)d->height * 16 / 25) return 1.0f; // 16:9 render targets (1920x1080, 960x540, 480x272, etc.)
+    uint32_t most = vk_ctx()->props.limits.maxImageDimension2D;
+    if ((uint32_t)lroundf((float)d->width * scale) > most || (uint32_t)lroundf((float)d->height * scale) > most) return 1.0f;
+    return scale;
+}
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound, n_thick;
@@ -396,8 +428,12 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     case NVN_TEXTURE_TARGET_CUBEMAP: case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: layers = L.layers; break;
     default: break;
     }
-    int scale = shadow_scale_of(d, &f, d->samples > 1 ? (uint32_t)d->samples : 1, tex_mirrored(t));
-    w *= (uint32_t)scale, h *= (uint32_t)scale;
+    float scale = (float)shadow_scale_of(d, &f, d->samples > 1 ? (uint32_t)d->samples : 1, tex_mirrored(t));
+    if (scale == 1.0f) scale = scene_scale_of(k->addr, d, &f, tex_mirrored(t));
+    if (scale != 1.0f) {
+        w = umax((uint32_t)lroundf((float)w * scale), 1u);
+        h = umax((uint32_t)lroundf((float)h * scale), 1u);
+    }
     uint32_t levels = umax(d->levels, 1), most = 1;
     for (uint32_t s = umax(umax(w, h), depth); s > 1; s >>= 1) most++;
     if (levels > most) levels = most;
@@ -471,7 +507,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
-    if (scale == 1 && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    if (scale == 1.0f && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
@@ -524,7 +560,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->bound = e->bound_to != NULL;
     p->block_views = (uint8_t)block_views;
     p->fb_usage = (uint8_t)fb_usage;
-    p->scale = (uint8_t)scale;
+    p->scale = scale;
 
     if (!defer_init) init_new(e);
     return e;
