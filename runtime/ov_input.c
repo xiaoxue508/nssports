@@ -584,8 +584,9 @@ static void play_for(int player, int side, const VibrationValue *v) {
     plat_mutex_lock(&vib_lock);
     if (vib_allowed) {
         rumble_cfg();
-        joycon_send_rumble(player, side, c.amp_low * rumble_strength, c.freq_low,
-                           c.amp_high * rumble_strength, c.freq_high);
+        float jc_gain = rumble_strength < 1.0f ? powf(rumble_strength, 1.6f) : rumble_strength;
+        joycon_send_rumble(player, side, c.amp_low * jc_gain, c.freq_low,
+                           c.amp_high * jc_gain, c.freq_high);
     } else {
         joycon_send_rumble(player, side, 0.0f, 160.0f, 0.0f, 320.0f);
     }

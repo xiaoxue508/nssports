@@ -838,50 +838,52 @@ void joycon_restart_six_axis(int player, int dev) {
     plat_mutex_unlock_shared(&jc_lock);
 }
 
-static void encode_hd_rumble_half(float amp, float freq, float default_freq, int high_band, uint8_t out[4]) {
-    static const uint8_t neutral[4] = {0x00, 0x01, 0x40, 0x40};
-    if (amp <= 0.01f) { memcpy(out, neutral, 4); return; }
+static uint8_t encode_hd_amp(float amp) {
+    if (amp <= 0.01f) return 0;
     if (amp > 1.0f) amp = 1.0f;
-    if (freq <= 0.0f) freq = default_freq;
-    if (high_band) {
-        if (freq < 81.75f) freq = 81.75f;
-        if (freq > 1252.57f) freq = 1252.57f;
-    } else {
-        if (freq < 40.87f) freq = 40.87f;
-        if (freq > 626.28f) freq = 626.28f;
-    }
-    int enc_freq = (int)lrintf(log2f(freq / 10.0f) * 32.0f);
-    uint8_t enc_amp = 0;
-    if (amp > 0.23f) enc_amp = (uint8_t)lrintf(log2f(amp * 8.7f) * 32.0f);
-    else if (amp > 0.12f) enc_amp = (uint8_t)lrintf(log2f(amp * 17.0f) * 16.0f);
-    else enc_amp = (uint8_t)lrintf(log2f(amp * 112.0f) * 4.0f);
-    if (enc_amp > 0x7eu) enc_amp = 0x7eu;
+    int enc = 0;
+    if (amp > 0.23f) enc = (int)lrintf(log2f(amp * 8.7f) * 32.0f);
+    else if (amp > 0.12f) enc = (int)lrintf(log2f(amp * 17.0f) * 16.0f);
+    else enc = (int)lrintf(log2f(amp * 112.0f) * 4.0f);
+    if (enc < 1) enc = 1;
+    if (enc > 0x7e) enc = 0x7e;
+    return (uint8_t)enc;
+}
 
-    if (high_band) {
-        uint16_t hf = (uint16_t)((enc_freq - 0x60) * 4);
+static void encode_hd_rumble(float amp_low, float freq_low, float amp_high, float freq_high, uint8_t out[4]) {
+    static const uint8_t neutral[4] = {0x00, 0x01, 0x40, 0x40};
+    memcpy(out, neutral, 4);
+
+    uint8_t enc_hi = encode_hd_amp(amp_high);
+    if (enc_hi) {
+        float f = freq_high > 0.0f ? freq_high : 320.0f;
+        if (f < 81.75f) f = 81.75f;
+        if (f > 1252.57f) f = 1252.57f;
+        int enc_freq = (int)lrintf(log2f(f / 10.0f) * 32.0f);
+        uint16_t hf = enc_freq > 0x60 ? (uint16_t)((enc_freq - 0x60) * 4) : 0;
         if (hf > 0x01fc) hf = 0x01fc;
-        uint16_t hf_amp = (uint16_t)(enc_amp * 2u);
+        uint16_t hf_amp = (uint16_t)(enc_hi * 2u);
         out[0] = (uint8_t)(hf & 0xffu);
         out[1] = (uint8_t)(((hf >> 8) & 0x01u) | (hf_amp & 0xfeu));
-        out[2] = neutral[2];
-        out[3] = neutral[3];
-    } else {
-        uint8_t lf = (uint8_t)(enc_freq - 0x40);
+    }
+
+    uint8_t enc_lo = encode_hd_amp(amp_low);
+    if (enc_lo) {
+        float f = freq_low > 0.0f ? freq_low : 160.0f;
+        if (f < 40.87f) f = 40.87f;
+        if (f > 626.28f) f = 626.28f;
+        int enc_freq = (int)lrintf(log2f(f / 10.0f) * 32.0f);
+        uint8_t lf = enc_freq > 0x40 ? (uint8_t)(enc_freq - 0x40) : 0;
         if (lf > 0x7fu) lf = 0x7fu;
-        uint16_t lf_amp = (uint16_t)((enc_amp >> 1) + 0x40u);
-        out[0] = neutral[0];
-        out[1] = neutral[1];
-        out[2] = (uint8_t)(lf | ((lf_amp & 0x01u) << 7));
-        out[3] = (uint8_t)(lf_amp >> 1);
+        out[2] = (uint8_t)(lf | ((enc_lo & 0x01u) << 7));
+        out[3] = (uint8_t)(0x40u + (enc_lo >> 1));
     }
 }
 
 void joycon_send_rumble(int player, int dev, float amp_low, float freq_low, float amp_high, float freq_high) {
     if (player < 0 || player >= JC_MAX_PLAYERS) return;
     uint8_t pkt[4];
-    float amp = amp_high > amp_low ? amp_high : amp_low;
-    int use_high = amp_high >= amp_low;
-    encode_hd_rumble_half(amp, use_high ? freq_high : freq_low, use_high ? 320.0f : 160.0f, use_high, pkt);
+    encode_hd_rumble(amp_low, freq_low, amp_high, freq_high, pkt);
 
     static const uint8_t neutral[4] = {0x00, 0x01, 0x40, 0x40};
     int on = memcmp(pkt, neutral, 4) != 0;
