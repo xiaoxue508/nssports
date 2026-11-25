@@ -107,8 +107,8 @@ static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window t
 // or the menu, and the mouse camera is on; release it otherwise. Safe from any thread.
 static void cursor_update(HWND h) {
     AcquireSRWLockExclusive(&cur_lock);
-    int want = h && cur_active && !(cur_rel & CUR_REL) && !cur_suspend && input_cursor_allowed() &&
-               GetForegroundWindow() == h && !IsIconic(h);
+    (void)h;
+    int want = 0; // Never force-capture or ClipCursor the mouse to the game window
     RECT r;
     POINT tl = {0, 0};
     if (want && GetClientRect(h, &r) && ClientToScreen(h, &tl)) {

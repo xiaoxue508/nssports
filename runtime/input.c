@@ -987,107 +987,18 @@ static uint64_t g_buttons_last;   // the merged buttons of the last poll (input_
 static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     uint64_t b = 0;
     int32_t sl[2] = {0, 0}, sr[2] = {0, 0};
+    (void)walk_get; (void)mouse_camera; (void)pick; (void)shake_stick; (void)wheel_route;
     plat_mutex_lock(&lock);
     if (!state) start();
     if (state > 0) {
         binds_refresh();
         if (state == 1) pad_read(&b, sl, sr);
-        int pad_used = b || abs(sl[0]) > PAD_USED || abs(sl[1]) > PAD_USED || abs(sr[0]) > PAD_USED ||
-                       abs(sr[1]) > PAD_USED, kbm_used = 0;
-        if (ikb_foreground()) {
-            uint8_t down[KEY_COUNT] = {0};
-            // Mouse buttons count only while the cursor is captured, and a button already held when the capture began
-            // (the click that refocused the window) is ignored until it is released. While a game menu has the pointer
-            // (menu_cursor.c) and it is over the window, the left and right buttons are that menu's A and B, and the
-            // middle and side buttons keep their bindings: bound to L and R they turn the menu's tabs.
-            static int was_captured;
-            static uint8_t mouse_ignore[KEY_COUNT];
-            int cap = ikb_captured();
-            float pointer_x, pointer_y;
-            int menu_pointer = !cap && menu_cursor_pointer() && ikb_pointer(&pointer_x, &pointer_y);
-            for (int k = 1; k < KEY_COUNT; k++) {
-                down[k] = ikb_down(k);
-                kbm_used |= down[k];
-                if (k < KEY_MOUSE_L || k > KEY_MOUSE_X2) continue;
-                if (cap && !was_captured) mouse_ignore[k] = down[k];
-                if (!down[k]) mouse_ignore[k] = 0;
-                int counts = cap || (menu_pointer && k != KEY_MOUSE_L && k != KEY_MOUSE_R);
-                if (!counts || mouse_ignore[k]) down[k] = 0;
-            }
-            was_captured = cap;
-            // On the Purah Pad's map (menu_cursor.c finds it, TOTK_MAP_CLICK) the left mouse button presses A at the
-            // map's cursor, which the mouse moves there, instead of its binding (Y by default). A press is one or the
-            // other from the moment it goes down until it is released, so a button held as the map opens or closes
-            // keeps what it pressed.
-            static int map_held, map_a;
-            if (!down[KEY_MOUSE_L]) map_held = map_a = 0;
-            else if (!map_held) map_held = 1, map_a = menu_cursor_map() && cfg_bool("TOTK_MAP_CLICK");
-            if (map_a) down[KEY_MOUSE_L] = 0, b |= 1ull << B_A;
-            // While a dialogue box is on screen (menu_cursor.c, TOTK_DIALOGUE_CLICK) the left mouse button presses B,
-            // which advances the text and also shows the rest of a line at once, and the right one presses A, instead
-            // of their bindings: Y by default, which opens the dialogue log there, and ZL. A press is one or the other
-            // from the moment it goes down until it is released, so a click that closes the last box does not turn
-            // into an attack while it is still held, and a button held as the box opens does not skip its first line.
-            // Dialogue choices have the pointer, and their clicks are menu_cursor.c's: a left click there is A.
-            static const uint8_t click_key[2] = {KEY_MOUSE_L, KEY_MOUSE_R}, click_btn[2] = {B_B, B_A};
-            static int click_held[2], click_talk[2];
-            for (int i = 0; i < 2; i++) {
-                int key = click_key[i];
-                if (!down[key]) click_held[i] = click_talk[i] = 0;
-                else if (!click_held[i]) click_held[i] = 1, click_talk[i] = menu_cursor_dialogue();
-                if (click_talk[i]) down[key] = 0, b |= 1ull << click_btn[i];
-            }
-            // The quick save and quick load keys are quicksave's while it is on (quicksave.c): they reach no binding
-            // then, and do nothing while the settings menu or a text entry is open
-            if (quicksave_on()) quicksave_keys(down, !g_menu && !g_block);
-            if (cap && !g_menu && !g_block) gameplay_tweaks_prepare_keys(down, b);
-            else gameplay_tweaks_reset();
-            b |= input_map_buttons(down);
-            int32_t k[2];
-            walk_get();
-            int walk = walk_key != KEY_NONE && down[walk_key];
-            input_map_stick(down, 0, k);
-            if (walk) k[0] = (int32_t)(k[0] * walk_scale), k[1] = (int32_t)(k[1] * walk_scale);
-            pick(&sl[0], &sl[1], k[0], k[1]);
-            input_map_stick(down, 1, k);
-            if (walk) k[0] = (int32_t)(k[0] * walk_scale), k[1] = (int32_t)(k[1] * walk_scale);
-            pick(&sr[0], &sr[1], k[0], k[1]);
-            int selector = b & (1ull << B_L) ? 1 : b & (1ull << B_UP) ? 2 :
-                           b & (1ull << B_LEFT) ? 3 : b & (1ull << B_RIGHT) ? 4 : 0;
-            // Only while the wheel or a strip is on screen (menu_cursor.c reads the focused screen): L also soothes the
-            // horse and turns menu tabs, the D-pad does other things too, and then the mouse stays on the camera.
-            // Before the screens were read (the menu cursor off) the buttons alone decide, as before.
-            if (selector && menu_cursor_shortcut() == 0) selector = 0;
-            mouse_camera(k, selector);
-            // On the map the left stick moves the cursor and the right one zooms: the mouse moves the cursor there
-            // (the scroll wheel zooms, wheel_route)
-            if (menu_cursor_map()) pick(&sl[0], &sl[1], k[0], k[1]);
-            else pick(&sr[0], &sr[1], k[0], k[1]);
-            int32_t shake = shake_stick(input_map_held(down, B_SHAKE));
-            if (shake) sr[0] = shake, sr[1] = 0;
-            // A mouse shake (mouse_direct.c) moves the stick with the mouse, side by side, and lets go when it rests
-            else if (input_direct_mouse_shake()) sr[0] = input_direct_mouse_shake() * STICK_MAX, sr[1] = 0;
-            static uint32_t travel_seen;
-            uint32_t travel = ikb_mouse_travel();
-            if (travel - travel_seen >= MOUSE_USED) kbm_used = 1;
-            travel_seen = travel;
-        }
-        // A press or a full-way stick on the pad wins over keys held in the same poll: the player picked it up
-        if (pad_used) __atomic_store_n(&g_kbm_last, 0, __ATOMIC_RELAXED);
-        else if (kbm_used) __atomic_store_n(&g_kbm_last, 1, __ATOMIC_RELAXED);
-    }
-    // Without the keyboard and mouse poll above (TOTK_INPUT=none in scripted runs, or the window in the background), a
-    // script's MOUSE lines still move the right stick wherever the mouse would (mouse_camera)
-    if (!(state > 0 && ikb_foreground()) && input_script_mouse_recent() && !input_direct_mouse_active()) {
-        int32_t k[2];
-        mouse_camera(k, 0);
-        pick(&sr[0], &sr[1], k[0], k[1]);
+        __atomic_store_n(&g_kbm_last, 0, __ATOMIC_RELAXED);
     }
     script_seen = 0;
     script_apply(&script_seen, sl, sr);
     b |= script_seen;
-    wheel_route(&b, sl, sr);
-    gameplay_tweaks_apply(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), input_gameplay_active(), &b, &sl[0], &sl[1], &sr[0], &sr[1]);
+    gameplay_tweaks_reset();
     rec_apply(b, sl, sr);
     // Minus and Plus held together (gamepad or keys) open or close the menu and never reach the game
     static int combo_held;
@@ -1119,9 +1030,7 @@ static volatile uint64_t g_block_closed, g_menu_closed;
 #define RELEASE_WAIT_NS 1000000000ull
 
 int input_cursor_allowed(void) {
-    const char *in = cfg_get("TOTK_INPUT");
-    return g_block != 1 && g_menu != 1 && (gameplay_tweaks_capture_needed() || mouse_sens_get() > 0) &&
-           !(in && !strcmp(in, "none")) && !menu_cursor_pointer();
+    return 0;
 }
 
 void input_block(int on) {
@@ -1161,8 +1070,6 @@ static int blocked(volatile int32_t *flag, volatile uint64_t *closed, const char
 
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
-    // While quick load drives the game's load menu the pointer leaves it alone and the game gets only its presses
-    if (!g_block && !g_menu && !quicksave_busy()) menu_cursor_poll(buttons);
     // A quick load under way goes on while the settings menu or a text entry opens: the held picture ends with it
     if ((quicksave_busy() || (!g_block && !g_menu)) && quicksave_poll(buttons, lx, ly, rx, ry)) return;
     const int32_t axes[4] = {*lx, *ly, *rx, *ry};
