@@ -2,23 +2,30 @@
 
 > **项目**：*Nintendo Switch Sports*（Title ID `0100D2F00D5C0000`，USA v0）Windows x86-64 静态重编译
 > **工作区**：`E:\nssports` ｜ **当前分支**：`opensport`（基线 `master` = `f7a84fc`）
-> **远程仓库**：`https://github.com/xiaoxue508/nssports`（private）
-> **当前产物**：`E:\nssports\build\v0\nssports.exe`（462 目标文件编译通过，0 警告 0 错误）
+> **远程仓库**：`https://github.com/xiaoxue508/nssports`（public）
+> **当前产物**：`E:\nssports\build\v0\nssports.exe`（基于基线 `f7a84fc` + Joy-Con 修复重编译，462 目标文件，0 错误）
 > **更新日期**：2026-11-25
 
-工程目录结构与依赖清单另见 [PROGRESS.md](PROGRESS.md)。本文档为接手入口，按**「红线规范 → 现状速览 → 代码台账 → 问题画像与根因实证 → 已证伪总表 → 下一步行动」**组织。
+> **⚠️ 代码库已重置说明（接手必看）**：当前 `opensport` 分支已干净恢复为 **`f7a84fc` baseline + 仅保留 `94b3575` 的 Joy-Con 手柄修复**（`runtime/input.c`、`runtime/input_joycon_win.c`、`runtime/ov_input.c`）及本文档；下文第 3 节中其余历史功能（OpenH264、2DArray 立方体视图、F12 抓帧、`a1026d5` 预通道 `LESS_OR_EQUAL`、临时 `NSS_DIAG_*` 钩子及未提交的 GS 补丁）均已按用户要求从代码中彻底移除。**但第 4–5 节记录的所有问题现象、根因实证与已证伪路径依然有效**，新会话可直接在此干净基线上重新设计与实现修复（注意先补回所需的基础修复如 `LESS_OR_EQUAL` / 2DArray / 按需日志，再设计干净的 `NVN_STAGE_GS` 方案）。
+
+本文档为新会话接手入口，按**「红线与省 Token 规范 → 现状速览 → 历史改动参考 → 问题画像与根因实证 → 已证伪总表 → 下一步行动」**组织。
 
 ---
 
-## 1. 协作与构建红线（务必严格遵守）
+## 1. 协作、构建与省 Token 红线（下任 Agent 务必严格遵守）
 
 1. **严禁自行启动 `nssports.exe`**（无论前台还是后台）。需要实机测试时，提供**单行可复制的 PowerShell 命令**（需包含 `Remove-Item Env:...` 清理残留变量），由用户在 `E:\nssports\build\v0` 已打开的终端中亲自执行；**查日志命令与启动 `.\nssports.exe` 命令必须分开提供**（启动游戏会实时刷新日志把前面的查询输出冲掉）。
 2. **严禁向 C 盘写入构建缓存或临时文件**：构建前必须将临时目录指向 E 盘：
    ```powershell
-   $env:TEMP="E:\nssports\build\tmp"; $env:TMP="E:\nssports\build\tmp"; python tools/build_game.py --version v0 --jobs 8
+   $env:TEMP="E:\nssports\build\tmp"; $env:TMP="E:\nssports\build\tmp"; E:\nssports\.venv\Scripts\python.exe tools/build_game.py --version v0 --jobs 8
    ```
-3. **文件规范**：`core.autocrlf=false`，源码与文档保持 **LF** 换行；**严禁手改 `generated/`**。向 PowerShell 传多行或含嵌套引号的 Python 补丁脚本时，一律使用 Base64 解码执行，避免 PowerShell 转义破坏语法。
-4. **看图与工具**：允许直接读取 `.png` / `.jpg`，但为节省上下文，先用 Python 对 `passes.txt` / `images.txt` / raw dump 做数值统计与通道差值定位，再按需读关键图。SPIR-V 反汇编工具位于 `E:\nssports\toolchain\msys64\ucrt64\bin\spirv-dis.exe`。
+3. **文件规范**：`core.autocrlf=false`，源码与文档保持 **LF** 换行；**严禁手改 `generated/`**。向 PowerShell 传多行或含嵌套引号的 Python 补丁脚本时，一律使用 here-string（`@' ... '@ | python -`）或 Base64 解码执行，避免 PowerShell 转义破坏语法。
+4. **省 Token 与看图硬性规则（极重要，违背会极快烧干上下文）**：
+   - **能用数值统计，绝不直接读图**：禁止直接读取全分辨率（如 `1600x900` / `1920x1080`）截图或多张 `pass_*.png`。所有像素均值、有效色数、全黑占比、`NaN`/Inf 检测、指定坐标 RGB 值、两次运行差异率等，**一律先用 Python（`PIL`/`numpy`）输出 ≤30 行的文本摘要**。
+   - **非看图不可时，只看 1 张裁剪/缩小拼图**：必须看视觉效果时，先用 Python 把关注区域（或 A/B 对比 + 差异图）裁剪拼接并缩放到 `≤800x450`，**只读这一张图**；结论写入文档后提醒用户适时新开短会话（或 `/compact`），避免图片滞留对话历史中在后续每轮重复计费。
+   - **禁止大文件盲读与全库扫描**：查 `runtime/` 代码必须先用 `git grep -n` 定位行号，再按 `StartLine/EndLine` 分段只读相关函数（≤150 行），禁止整文件读 `vk_exec_draw.c` / `vk_pipeline.c`；**严禁递归扫描 `generated/`、`build/v0/shader-cache/`、`tools/vendor/`**——需要长链条回溯（如 `generated/v0/main_*.c`）时，优先派发只读 `research` 子代理调研，只把精简结论带回主对话。
+   - **日志与命令输出必须裁剪**：查看 `totk.log`、`passes.txt` 或目录列表时，必须附带 `Select-String` / `Select-Object -First 40` 或 Python 去重统计，禁止把数千行原样输出灌入上下文。
+   - **少轮次、先规划再动大文件**：多文件架构改动（如接入 `NVN_STAGE_GS`）先列简短方案对齐再编码；给用户的测试命令单次尽量收集齐所需诊断信息，减少“改一点→跑一次”的碎片轮次。SPIR-V 反汇编工具位于 `E:\nssports\toolchain\msys64\ucrt64\bin\spirv-dis.exe`。
 
 ### 常用单行命令参考
 
