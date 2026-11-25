@@ -44,6 +44,17 @@
    - **间接命令头清零 VS 模拟（[gfx.h](runtime/gfx.h)、[gfx_shader.c](runtime/gfx_shader.c)、[vk_exec_draw.c](runtime/vk_exec_draw.c)）**：`pass 0000` 顶点着色器从 VS SSBO 0 读取 64 位地址并用全局内存写（`STG`）将约 310 个 `DrawIndexedIndirect` 命令头初始化为 `(0, 1, 0, 0, 0)`；由于地址并非直接来自 `c0` SSBO 槽位，Ryujinx `GlobalToStorage` 将其降级为空 `OpReturn`。现于反射阶段精确识别该着色器（`detect_indirect_clear_vs`），并在 `op_draw` 中通过 `try_indirect_clear_draw` 以批量 `vkCmdCopyBuffer`（配合 `VK_MEM_USE`、`vk_mem_gpu_wrote` 及前后 `vk_exec_barrier`）完成初始化。
 4. **F12 按需帧转储**：
    - [input_win.c](runtime/input_win.c)、[vk_dump.c](runtime/vk_dump.c)、[vk_backend.c](runtime/vk_backend.c)、[vk_exec.h](runtime/vk_exec.h)、[vk_exec_draw.c](runtime/vk_exec_draw.c)：支持在游戏中按 `F12` 触发单帧 `passes.txt` + `images.txt` + PNG 转储（含 `gs` 与 `ind` 状态）。
+5. **双人 Joy-Con 自动拆分与 2P 档案空指针保护**（实机访客双人游玩正常）：
+   - [input_joycon.h](runtime/input_joycon.h)、[input_joycon_win.c](runtime/input_joycon_win.c)、[ov_input.c](runtime/ov_input.c)：新增 `joycon_set_game_single_hint()`，在 `TOTK_JOYCON_MODE=auto` 下响应 `SetNpadJoyAssignmentModeSingle` 与 `ShowControllerSupport`，自动将 L/R Joy-Con 拆分为 1P/2P 并刷新 Player LED；支持 `refresh_cfg()` 动态切换模式。
+   - [patches-v0.txt](recomp/patches-v0.txt)：保留原有 spin waits 并追加 `null_guard_2p`（`main+0xbe887c` 入口判空 `x1 == 0` 跳转 `L_7000be88d8`），避免 2P 越界档案查询空指针崩溃（使用访客账户可正常双人游玩）。
+6. **窗口标题、输入与 ESC 菜单 NS Sports 适配**：
+   - [gfx_window_win.c](runtime/gfx_window_win.c)：窗口标题改为 `"Nintendo Switch Sports"`；[ui_text.c](runtime/ui_text.c) HUD 顶部版本文案改为 `"NS Sports Recomp"`。
+   - [input.c](runtime/input.c)、[input_win.c](runtime/input_win.c)：移除原 TotK 键鼠映射逻辑，取消启动后 `ClipCursor` 强制锁鼠标。
+   - [menu.cpp](runtime/ui/menu.cpp)、[ui_text.h](runtime/ui_text.h)、[ui_text.c](runtime/ui_text.c)：在 Controls 页加入 `TOTK_JOYCON_MODE` 与 `TOTK_JOYCON_DRIVER` 选项，移除 TotK 专属项（草地/阴影/FOV/HUD 宽度/究极手/键鼠绑定/按键布局/Xbox 扳机振动/音频分轨音量等）。
+7. **3D 渲染比例（`TOTK_RENDER_SCALE`）接通与 HUD 显示修正**：
+   - [vk.h](runtime/vk.h)、[vk_exec.h](runtime/vk_exec.h)、[vk_texture.c](runtime/vk_texture.c)、[vk_exec.c](runtime/vk_exec.c)、[vk_exec_draw.c](runtime/vk_exec_draw.c)、[vk_exec_xfer.c](runtime/vk_exec_xfer.c)：将 Vulkan 后端 `scale` / `pass_scale` 扩展为浮点系数，按 `TOTK_RENDER_SCALE` 缩放 GPU 16:9 3D 渲染目标及对应 `Viewport` / `Scissor` / 区域拷贝，保持 `rgba8srgb` 交换链输出为原生尺寸。
+   - [nss_stubs.c](runtime/nss_stubs.c)：修正 `res_wanted()` 返回游戏实际输出（Docked `1920x1080` / Handheld `1280x720`），`res_sizes()` 按 `TOTK_RENDER_SCALE` 计算并反馈 HUD `3D 场景` 分辨率。
+   - 注：运行日志位于 `E:\nssports\build\v0\logs\totk.log`。
 
 ---
 
