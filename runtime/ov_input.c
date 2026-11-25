@@ -205,8 +205,14 @@ static int fill_npad_states(Cpu *c, NpadState *out, int max, uint32_t id, uint32
             input_poll(&kbtn, &klx, &kly, &krx, &kry);
             kbm_motion_poll(&kbtn, &klx, &kly, &krx, &kry);
             s.buttons |= kbtn;
-            if (klx || kly) { s.lx = klx; s.ly = kly; }
-            if (krx || kry) { s.rx = krx; s.ry = kry; }
+            if ((int64_t)klx * klx + (int64_t)kly * kly > (int64_t)s.lx * s.lx + (int64_t)s.ly * s.ly) {
+                s.lx = klx;
+                s.ly = kly;
+            }
+            if ((int64_t)krx * krx + (int64_t)kry * kry > (int64_t)s.rx * s.rx + (int64_t)s.ry * s.ry) {
+                s.rx = krx;
+                s.ry = kry;
+            }
             quicksave_guest(c);
             vk_reflex_marker(6, vk_reflex_frame());   // VK_LATENCY_MARKER_INPUT_SAMPLE_NV
         }
@@ -250,8 +256,10 @@ static void ov_hold_type(Cpu *c) {
     int64_t t = (int32_t)arg_x(c, 0);
     if (t < 0 || t > 1) rt_fatal("nn::hid::SetNpadJoyHoldType: invalid hold type %lld", (long long)t);
     plat_mutex_lock(&lock);
+    int prev = hold_type;
     hold_type = (int)t;
     plat_mutex_unlock(&lock);
+    if (prev != (int)t) rt_log("hid: npad joy hold type %d (%s)", (int)t, t ? "horizontal" : "vertical");
 }
 
 static void ov_get_hold_type(Cpu *c) {

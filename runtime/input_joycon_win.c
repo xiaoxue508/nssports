@@ -30,6 +30,7 @@
 #define JC_SILENT_RESYNC_NS 2000000000ull
 
 #define STYLE_FULL_KEY  (1u << 0)
+#define STYLE_HANDHELD  (1u << 1)
 #define STYLE_JOY_DUAL  (1u << 2)
 #define STYLE_JOY_LEFT  (1u << 3)
 #define STYLE_JOY_RIGHT (1u << 4)
@@ -261,7 +262,10 @@ static void handle_subcmd_reply(JoySlot *s, const uint8_t *r, size_t n) {
                 s->accel_origin[i] = (float)oa;
                 if (abs(da) > 1000) s->accel_scale[i] = 4.0f / (float)da;
                 s->gyro_origin[i] = (float)og;
-                if (abs(dg) > 1000) s->gyro_scale[i] = (abs(dg) == 13371 ? 816.0f : 936.0f) / (float)dg;
+                if (abs(dg) > 1000) {
+                    float s816 = 816.0f / (float)dg, s936 = 936.0f / (float)dg;
+                    s->gyro_scale[i] = fabsf(fabsf(s816) - 0.061f) <= fabsf(fabsf(s936) - 0.061f) ? s816 : s936;
+                }
             }
             s->spi_imu_ok = 1;
         } else if (addr == 0x603du && slen >= 18) {
@@ -658,18 +662,52 @@ static void apply_horizontal_remap(int kind, uint64_t *buttons, int32_t *lx, int
     *buttons = out;
 }
 
+static uint64_t mirror_left_to_right_btns(uint64_t in) {
+    uint64_t out = 0;
+    if (in & BTN_RIGHT) out |= BTN_A;
+    if (in & BTN_DOWN)  out |= BTN_B;
+    if (in & BTN_UP)    out |= BTN_X;
+    if (in & BTN_LEFT)  out |= BTN_Y;
+    if (in & BTN_L)     out |= BTN_R;
+    if (in & BTN_ZL)    out |= BTN_ZR;
+    if (in & BTN_MINUS) out |= BTN_PLUS;
+    if (in & BTN_LS)    out |= BTN_RS;
+    if (in & BTN_LSL)   out |= BTN_RSL;
+    if (in & BTN_LSR)   out |= BTN_RSR;
+    return out;
+}
+
+static uint64_t mirror_right_to_left_btns(uint64_t in) {
+    uint64_t out = 0;
+    if (in & BTN_A)     out |= BTN_RIGHT;
+    if (in & BTN_B)     out |= BTN_DOWN;
+    if (in & BTN_X)     out |= BTN_UP;
+    if (in & BTN_Y)     out |= BTN_LEFT;
+    if (in & BTN_R)     out |= BTN_L;
+    if (in & BTN_ZR)    out |= BTN_ZL;
+    if (in & BTN_PLUS)  out |= BTN_MINUS;
+    if (in & BTN_RS)    out |= BTN_LS;
+    if (in & BTN_RSL)   out |= BTN_LSL;
+    if (in & BTN_RSR)   out |= BTN_LSR;
+    return out;
+}
+
 int joycon_player_read(int player, uint32_t style_mask, uint64_t *buttons,
                        int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry, int hold_type) {
     if (player < 0 || player >= JC_MAX_PLAYERS) return 0;
     *buttons = 0;
     *lx = *ly = *rx = *ry = 0;
     int found = 0, single_kind = JC_KIND_NONE;
+    int has_l = 0, has_r = 0, has_pro = 0;
     plat_mutex_lock_shared(&jc_lock);
     for (int i = 0; i < JC_MAX_SLOTS; i++) {
         const JoySlot *s = &slots[i];
         if (!s->active || s->player != player || !s->have_report) continue;
         found = 1;
         single_kind = s->kind;
+        if (s->kind == JC_KIND_LEFT) has_l = 1;
+        else if (s->kind == JC_KIND_RIGHT) has_r = 1;
+        else if (s->kind == JC_KIND_PRO) has_pro = 1;
         *buttons |= s->buttons;
         if (s->kind == JC_KIND_LEFT || s->kind == JC_KIND_PRO) {
             *lx = s->lx;
@@ -685,6 +723,30 @@ int joycon_player_read(int player, uint32_t style_mask, uint64_t *buttons,
     if (hold_type == 1 && (style_mask == STYLE_JOY_LEFT || style_mask == STYLE_JOY_RIGHT)) {
         apply_horizontal_remap(single_kind, buttons, lx, ly, rx, ry);
         if (single_kind == JC_KIND_RIGHT) { *lx = *rx; *ly = *ry; }
+    } else if (has_l && !has_r && !has_pro) {
+        if (style_mask & (STYLE_JOY_DUAL | STYLE_FULL_KEY | STYLE_HANDHELD)) {
+            *buttons |= mirror_left_to_right_btns(*buttons);
+            *rx = *lx;
+            *ry = *ly;
+        } else if (style_mask == STYLE_JOY_RIGHT) {
+            *buttons = mirror_left_to_right_btns(*buttons);
+            *rx = *lx;
+            *ry = *ly;
+            *lx = 0;
+            *ly = 0;
+        }
+    } else if (has_r && !has_l && !has_pro) {
+        if (style_mask & (STYLE_JOY_DUAL | STYLE_FULL_KEY | STYLE_HANDHELD)) {
+            *buttons |= mirror_right_to_left_btns(*buttons);
+            *lx = *rx;
+            *ly = *ry;
+        } else if (style_mask == STYLE_JOY_LEFT) {
+            *buttons = mirror_right_to_left_btns(*buttons);
+            *lx = *rx;
+            *ly = *ry;
+            *rx = 0;
+            *ry = 0;
+        }
     }
     return 1;
 }
@@ -797,13 +859,17 @@ void joycon_send_rumble(int player, int dev, float amp_low, float freq_low, floa
     int on = memcmp(pkt, neutral, 4) != 0;
 
     plat_mutex_lock(&jc_lock);
+    int matched = 0;
+    JoySlot *fallback = NULL;
     for (int i = 0; i < JC_MAX_SLOTS; i++) {
         JoySlot *s = &slots[i];
         if (!s->active || s->player != player || !s->hid) continue;
+        if (!fallback) fallback = s;
         int match = (s->kind == JC_KIND_PRO) ||
                     (dev == 0 && s->kind == JC_KIND_LEFT) ||
                     (dev == 1 && s->kind == JC_KIND_RIGHT);
         if (!match) continue;
+        matched = 1;
         if (s->kind == JC_KIND_RIGHT) {
             memcpy(s->rumble_bytes, neutral, 4);
             memcpy(s->rumble_bytes + 4, pkt, 4);
@@ -813,6 +879,17 @@ void joycon_send_rumble(int player, int dev, float amp_low, float freq_low, floa
         }
         s->rumble_dirty = 1;
         if (on) s->rumble_silence_left = 3;
+    }
+    if (!matched && fallback) {
+        if (fallback->kind == JC_KIND_RIGHT) {
+            memcpy(fallback->rumble_bytes, neutral, 4);
+            memcpy(fallback->rumble_bytes + 4, pkt, 4);
+        } else {
+            memcpy(fallback->rumble_bytes, pkt, 4);
+            memcpy(fallback->rumble_bytes + 4, fallback->kind == JC_KIND_PRO ? pkt : neutral, 4);
+        }
+        fallback->rumble_dirty = 1;
+        if (on) fallback->rumble_silence_left = 3;
     }
     plat_mutex_unlock(&jc_lock);
 }

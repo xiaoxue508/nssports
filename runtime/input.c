@@ -15,6 +15,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "input.h"
+#include "input_joycon.h"
 #include "input_map.h"
 #include "input_wsys.h"
 #include "nvn_api.h"
@@ -487,6 +488,13 @@ static void raw_ids(SDL_JoystickID id, uint16_t *v, uint16_t *p) {
     SDL_GetJoystickGUIDInfo(SDL_GetGamepadGUIDForID(id), v, p, NULL, NULL);
 }
 
+static int joycon_owned_id(SDL_JoystickID id) {
+    if (joycon_driver_mode() != 1) return 0;
+    uint16_t v = 0, p = 0;
+    raw_ids(id, &v, &p);
+    return v == 0x057eu && (p == 0x2006u || p == 0x2007u || p == 0x2009u);
+}
+
 static int steam_hidden_id(SDL_JoystickID id) {
     uint16_t v, p;
     raw_ids(id, &v, &p);
@@ -512,7 +520,7 @@ static int has_motion(SDL_Gamepad *g) {
 static int unhidden_pad_present(void) {
     int n = 0, found = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
-    for (int i = 0; ids && i < n && !found; i++) found = !steam_hidden_id(ids[i]);
+    for (int i = 0; ids && i < n && !found; i++) found = !joycon_owned_id(ids[i]) && !steam_hidden_id(ids[i]);
     SDL_free(ids);
     return found;
 }
@@ -548,7 +556,7 @@ static void scan_pads(void) {
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
     for (int pass = 0; pass < 2 && !pad; pass++)
         for (int i = 0; ids && i < n && !pad; i++)
-            if (steam_hidden_id(ids[i]) == pass) {
+            if (!joycon_owned_id(ids[i]) && steam_hidden_id(ids[i]) == pass) {
                 // The controller motion_source holds for its sensors serves as the pad too: one open handle
                 if (motion_extra && SDL_GetGamepadID(motion_extra) == ids[i]) { pad = motion_extra; motion_extra = NULL; }
                 else pad = SDL_OpenGamepad(ids[i]);
@@ -674,6 +682,14 @@ static void start(void) {
     // keep working there. With the setting off the game's main thread waits while unfocused and reads no input, so
     // the hint can stay on for the whole run.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    int jc_mode = joycon_driver_mode();
+    if (jc_mode == 1) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_JOY_CONS, "0");
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH, "0");
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, "0");
+    } else if (jc_mode == 2) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_VERTICAL_JOY_CONS, "1");
+    }
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
     else state = 1;
     if (state == 1) test_pad_attach();
@@ -1398,7 +1414,7 @@ static SDL_Gamepad *motion_source(void) {
         for (int i = 0; ids && i < n && !motion_extra; i++) {
             int seen = 0;
             for (int r = 0; r < 8; r++) seen |= rejected[r] == ids[i];
-            if (ids[i] == skip || seen || !steam_hidden_id(ids[i])) continue;
+            if (ids[i] == skip || seen || joycon_owned_id(ids[i]) || !steam_hidden_id(ids[i])) continue;
             SDL_Gamepad *g = SDL_OpenGamepad(ids[i]);
             if (g && has_motion(g)) {
                 motion_extra = g;
