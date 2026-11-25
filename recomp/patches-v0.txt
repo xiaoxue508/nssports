@@ -135,3 +135,7 @@ spin sdk b0d9c b0ee0   # 20 instructions; loads
 spin sdk 28f4f8 28f68c   # 15 instructions; loads
 spin sdk 2ddd4c 2dde80 2dde90   # 33 instructions; loads
 spin sdk 3db94c 3db96c   # 9 instructions; loads
+
+# Guard NULL x1 in main+0xbe887c when called from main+0xbefd14 (Player 2+ / Guest profile lookup)
+set  null_guard_2p TOTK_NULL_GUARD_2P 1
+site null_guard_2p main 0xbe887c b9402009 b9402009 b40002e1

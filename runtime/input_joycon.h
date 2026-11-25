@@ -44,6 +44,7 @@ void joycon_init(void);
 void joycon_shutdown(void);
 int joycon_driver_mode(void);        // 0=off, 1=hidapi, 2=sdl
 int joycon_pairing_mode(void);       // JC_MODE_AUTO / DUAL / SINGLE
+void joycon_set_game_single_hint(int single);
 void joycon_rescan(void);
 void joycon_recenter_all(void);
 void joycon_calibrate_player(int player);

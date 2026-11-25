@@ -96,7 +96,7 @@ static PlatMutex jc_lock = PLAT_MUTEX_INIT;
 static JoySlot slots[JC_MAX_SLOTS];
 static volatile int32_t jc_started, jc_stop, jc_rescan_req;
 static uint32_t cfg_seen;
-static int cached_driver = 1, cached_mode = JC_MODE_AUTO;
+static int cached_driver = 1, cached_mode = JC_MODE_AUTO, game_single_hint = 0;
 
 static int16_t rd_s16(const uint8_t *p) { return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
 static uint16_t rd_u16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
@@ -126,10 +126,11 @@ static void slot_default_cal(JoySlot *s) {
     }
 }
 
-static void refresh_cfg(void) {
+static int refresh_cfg(void) {
     unsigned v = cfg_version();
-    if (v == cfg_seen && jc_started) return;
+    if (v == cfg_seen && jc_started) return 0;
     cfg_seen = v;
+    int prev_mode = cached_mode;
     const char *drv = cfg_get("TOTK_JOYCON_DRIVER");
     if (!drv || !*drv || !strcmp(drv, "auto") || !strcmp(drv, "hidapi")) cached_driver = 1;
     else if (!strcmp(drv, "sdl")) cached_driver = 2;
@@ -140,6 +141,7 @@ static void refresh_cfg(void) {
     else if (!strcmp(mode, "dual")) cached_mode = JC_MODE_DUAL;
     else if (!strcmp(mode, "single")) cached_mode = JC_MODE_SINGLE;
     else cached_mode = JC_MODE_AUTO;
+    return cached_mode != prev_mode;
 }
 
 static void send_subcmd(JoySlot *s, uint8_t sub, const uint8_t *arg, size_t arg_len) {
@@ -163,7 +165,9 @@ static uint8_t player_led_mask(int player) {
 
 static void assign_players_locked(void) {
     refresh_cfg();
+    int prev_player[JC_MAX_SLOTS];
     for (int i = 0; i < JC_MAX_SLOTS; i++) {
+        prev_player[i] = slots[i].player;
         if (!slots[i].active) continue;
         slots[i].player = -1;
         slots[i].assigned_side = (slots[i].kind == JC_KIND_RIGHT) ? 1 : 0;
@@ -182,7 +186,8 @@ static void assign_players_locked(void) {
         }
     }
 
-    if (cached_mode == JC_MODE_SINGLE) {
+    int single_mode = (cached_mode == JC_MODE_SINGLE) || (cached_mode == JC_MODE_AUTO && game_single_hint);
+    if (single_mode) {
         for (int i = 0; i < JC_MAX_SLOTS; i++) {
             if (!slots[i].active || slots[i].kind == JC_KIND_PRO || slots[i].player >= 0) continue;
             for (int p = 0; p < JC_MAX_PLAYERS; p++) {
@@ -204,6 +209,13 @@ static void assign_players_locked(void) {
                 used_mask[p] |= bit;
                 break;
             }
+        }
+    }
+
+    for (int i = 0; i < JC_MAX_SLOTS; i++) {
+        if (slots[i].active && slots[i].player != prev_player[i] && slots[i].handshake_step >= 9) {
+            slots[i].handshake_step = 8; // re-send player LEDs
+            slots[i].next_cmd_ns = 0;
         }
     }
 }
@@ -471,7 +483,11 @@ static void joycon_thread_main(void *arg) {
     }
     uint64_t next_scan = 0;
     while (!plat_cas32(&jc_stop, 0, 0)) {
-        refresh_cfg();
+        if (refresh_cfg()) {
+            plat_mutex_lock(&jc_lock);
+            assign_players_locked();
+            plat_mutex_unlock(&jc_lock);
+        }
         uint64_t now = kern_now_ns();
         if (cached_driver == 1 && (now >= next_scan || plat_xchg32(&jc_rescan_req, 0))) {
             scan_devices(now);
@@ -561,6 +577,18 @@ int joycon_driver_mode(void) {
 int joycon_pairing_mode(void) {
     refresh_cfg();
     return cached_mode;
+}
+
+void joycon_set_game_single_hint(int single) {
+    int want = single ? 1 : 0;
+    plat_mutex_lock(&jc_lock);
+    int changed = (game_single_hint != want);
+    game_single_hint = want;
+    if (changed && cached_mode == JC_MODE_AUTO) {
+        assign_players_locked();
+        rt_log("joycon: auto-pairing switched to %s (game request)", want ? "single" : "dual");
+    }
+    plat_mutex_unlock(&jc_lock);
 }
 
 void joycon_rescan(void) { plat_xchg32(&jc_rescan_req, 1); }

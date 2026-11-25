@@ -146,17 +146,22 @@ static void ov_supported_ids(Cpu *c) {
     uint32_t m = 0;
     for (uint64_t i = 0; i < n; i++) m |= id_bit(ids[i]);
     plat_mutex_lock(&lock);
+    uint32_t prev = supported_ids;
     supported_ids = m;
     plat_mutex_unlock(&lock);
+    if (prev != m) rt_log("hid: SetSupportedNpadIdType mask=%#x (%llu ids)", m, (unsigned long long)n);
     joycon_init();
     kbm_motion_init();
 }
 
 // void SetSupportedNpadStyleSet(NpadStyleSet styles)
 static void ov_supported_styles(Cpu *c) {
+    uint32_t s = (uint32_t)arg_x(c, 0);
     plat_mutex_lock(&lock);
-    styles = (uint32_t)arg_x(c, 0);
+    uint32_t prev = styles;
+    styles = s;
     plat_mutex_unlock(&lock);
+    if (prev != s) rt_log("hid: SetSupportedNpadStyleSet=%#x", s);
 }
 
 // NpadStyleSet GetSupportedNpadStyleSet()
@@ -274,6 +279,10 @@ static void ov_get_joy_assign(Cpu *c) {
     plat_mutex_lock_shared(&lock);
     int s = id < 4 ? (int)((single_mask >> id) & 1u) : 0;
     plat_mutex_unlock_shared(&lock);
+    if (!s && id < 4) {
+        uint32_t ps = joycon_player_style((int)id);
+        if (ps == STYLE_JOY_LEFT || ps == STYLE_JOY_RIGHT) s = 1;
+    }
     ret_x(c, (uint64_t)s);
 }
 
@@ -281,16 +290,24 @@ static void ov_set_joy_single(Cpu *c) {
     uint32_t id = *need_id(c, 0, "SetNpadJoyAssignmentModeSingle");
     if (id >= 4) return;
     plat_mutex_lock(&lock);
+    uint32_t prev = single_mask;
     single_mask |= 1u << id;
     plat_mutex_unlock(&lock);
+    if (!(prev & (1u << id)))
+        rt_log("hid: SetNpadJoyAssignmentModeSingle(id=%u)", id);
+    if (id == 0) joycon_set_game_single_hint(1);
 }
 
 static void ov_set_joy_dual(Cpu *c) {
     uint32_t id = *need_id(c, 0, "SetNpadJoyAssignmentModeDual");
     if (id >= 4) return;
     plat_mutex_lock(&lock);
+    uint32_t prev = single_mask;
     single_mask &= ~(1u << id);
     plat_mutex_unlock(&lock);
+    if (prev & (1u << id))
+        rt_log("hid: SetNpadJoyAssignmentModeDual(id=%u)", id);
+    if (id == 0) joycon_set_game_single_hint(0);
 }
 
 static void ov_swap_npad(Cpu *c) { (void)c; }
@@ -304,10 +321,18 @@ static void ov_disconnect(Cpu *c) {
 // Result ShowControllerSupport(ControllerSupportResultInfo *out, const ControllerSupportArg &arg)
 static uint32_t run_controller_support(ControllerSupportResult *out, const int8_t *arg) {
     int8_t min_p = arg ? arg[0] : 1, max_p = arg ? arg[1] : 4;
+    int enable_single = arg ? (int)arg[5] : 0;
     if (max_p <= 0) max_p = 4;
     int connected = 1;
     for (int p = 1; p < JC_MAX_PLAYERS; p++)
         if (joycon_player_style(p) != 0) connected++;
+    if (joycon_pairing_mode() == JC_MODE_AUTO && joycon_connected_count() >= 2 &&
+        (connected < min_p || (max_p >= 2 && enable_single))) {
+        joycon_set_game_single_hint(1);
+        connected = 1;
+        for (int p = 1; p < JC_MAX_PLAYERS; p++)
+            if (joycon_player_style(p) != 0) connected++;
+    }
     if (connected > max_p) connected = max_p;
     uint32_t sel = pad_id();
     if (out) *out = (ControllerSupportResult){.players = (int8_t)connected, .selected = sel};
@@ -316,7 +341,7 @@ static uint32_t run_controller_support(ControllerSupportResult *out, const int8_
         return RES_CTRL_CANCELED;
     }
     rt_log("hid: ShowControllerSupport min=%d max=%d single=%d -> %d connected (sel=%#x)",
-           min_p, max_p, arg ? (int)arg[5] : 0, connected, sel);
+           min_p, max_p, enable_single, connected, sel);
     return 0;
 }
 
