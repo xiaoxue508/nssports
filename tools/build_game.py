@@ -539,7 +539,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=(), runtime_lib=Non
     for src in sources:
         o = runtime_object(out, src)
         if src.suffix == '.rc':   # windres writes no depfile: the files nssports.rc embeds are listed by hand
-            lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "nssports.manifest")}')
+            lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "nssports.manifest")} {ninja_path(RUNTIME / "nssports.ico")}')
         else:
             stamp_dep = (' | ' if not pgo else ' ') + ninja_path(stamp) if stamp else ''
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}{pgo}{stamp_dep}')

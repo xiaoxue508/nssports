@@ -369,8 +369,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_QS_LOADING] = "Loading the quick save",
     [UI_QS_NOT_NOW] = "Quick save is not possible right now",
     [UI_QS_NONE] = "There is no quick save yet (the quick save key makes one)",
-    [UI_QS_FAILED] = "Quick save failed: see totk.log",
-    [UI_QS_LOAD_FAILED] = "Quick load failed: see totk.log",
+    [UI_QS_FAILED] = "Quick save failed: see nssports.log",
+    [UI_QS_LOAD_FAILED] = "Quick load failed: see nssports.log",
     [UI_MENU_MOUSE_SENS] = "Mouse camera sensitivity",
     [UI_MENU_MOUSE_SENS_DESC] = "How fast the mouse turns the camera.",
     [UI_MENU_WALK_KEY] = "Walk key",
@@ -511,8 +511,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_MENU_LANG] = "Menu language", [UI_MENU_MENU_LANG_DESC] = "Language of this menu and the overlay.",
     [UI_MENU_MENU_LANG_AUTO] = "Automatic (from Windows)",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
-    [UI_MENU_DISCORD_RPC_DESC] = "Shows \"Playing TotK Recomp\" with the play time in your Discord status while the "
-                                 "game runs. discord_app_id and discord_image in totk.ini choose the application.",
+    [UI_MENU_DISCORD_RPC_DESC] = "Shows \"Playing NS Sports Recomp\" with the play time in your Discord status while the "
+                                 "game runs. discord_app_id and discord_image in nssports.ini choose the application.",
 
     [UI_MENU_ADV_WARNING] = "These settings are for testing and troubleshooting. Change them only when you know why.",
     [UI_MENU_GROUP_SCHED] = "Scheduling", [UI_MENU_GROUP_SHADERS] = "Shaders and pipelines",
@@ -2393,7 +2393,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_MENU_LANG_DESC] = "本菜单和性能浮层的语言。",
     [UI_MENU_MENU_LANG_AUTO] = "自动（跟随 Windows）",
     [UI_MENU_DISCORD_RPC] = "Discord Rich Presence",
-    [UI_MENU_DISCORD_RPC_DESC] = "游戏运行时在 Discord 状态中显示“正在玩 TotK Recomp”及游戏时长。totk.ini 中的 "
+    [UI_MENU_DISCORD_RPC_DESC] = "游戏运行时在 Discord 状态中显示“正在玩 NS Sports Recomp”及游戏时长。nssports.ini 中的 "
                                  "discord_app_id 和 discord_image 选择应用。",
     [UI_MENU_ADV_WARNING] = "这些设置用于测试和排查问题，请在了解原因后再修改。",
     [UI_MENU_GROUP_SCHED] = "调度",
@@ -2613,8 +2613,8 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_QS_LOADING] = "正在读取快速存档",
     [UI_QS_NOT_NOW] = "现在无法快速存档",
     [UI_QS_NONE] = "还没有快速存档（按快速存档键创建）",
-    [UI_QS_FAILED] = "快速存档失败：请查看 totk.log",
-    [UI_QS_LOAD_FAILED] = "快速读档失败：请查看 totk.log",
+    [UI_QS_FAILED] = "快速存档失败：请查看 nssports.log",
+    [UI_QS_LOAD_FAILED] = "快速读档失败：请查看 nssports.log",
     [UI_MENU_PROMPTS_MISSING] = "缺少按键提示文件：请重新运行安装程序",
     [UI_MENU_PROMPTS_FAILED] = "按键提示文件已损坏：请重新运行安装程序",
     [UI_MENU_PROMPTS_RESTART] = "按键提示重启后生效",

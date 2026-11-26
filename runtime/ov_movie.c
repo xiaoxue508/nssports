@@ -131,10 +131,14 @@ static void guest_init(void) {
         G.buf_set_range = need("_ZN5movie6Buffer8SetRangeEii");
         G.buf_set_data = need("_ZN5movie6Buffer18SetDataAndCapacityEPvm");
         G.buf_base = need("_ZNK5movie6Buffer4BaseEv");
+        G.buf_data = ldr_symbol("_ZNK5movie6Buffer4DataEv");
+        G.buf_offset = ldr_symbol("_ZNK5movie6Buffer6OffsetEv");
+        G.buf_size = ldr_symbol("_ZNK5movie6Buffer4SizeEv");
         G.buf_capacity = need("_ZNK5movie6Buffer8CapacityEv");
         G.md_find_int32 = need("_ZNK5movie9MediaData9FindInt32EPKcPi");
         G.md_find_string = need("_ZNK5movie9MediaData10FindStringEPKcPS2_");
         G.md_find_data = ldr_symbol("_ZNK5movie9MediaData8FindDataEPKcPPKvPm");
+        G.md_find_buffer = ldr_symbol("_ZNK5movie9MediaData10FindBufferEPKcPPNS_6BufferE");
         G.md_set_int32 = need("_ZN5movie9MediaData8SetInt32EPKci");
         G.md_set_rect = need("_ZN5movie9MediaData7SetRectEPKciiii");
         G.md_set_string = need("_ZN5movie9MediaData9SetStringEPKcS2_");
@@ -449,22 +453,56 @@ static void avcc_config_to_annexb(const uint8_t *src, int len, uint8_t **out, in
 static void append_annexb_csd(uint8_t **buf, int *len, const uint8_t *src, int src_len) {
     if (!src || src_len <= 0) return;
     if (has_start_code(src, src_len)) append_bytes(buf, len, src, src_len);
+    else if (src_len >= 7 && src[0] == 1 && (src[4] & 0xfc) == 0xfc && (src[5] & 0xe0) == 0xe0)
+        avcc_config_to_annexb(src, src_len, buf, len);
     else append_annexb_nal(buf, len, src, src_len);
+}
+static int find_md_bytes(Cpu *c, uint64_t md, const char *key, const uint8_t **out_ptr, int *out_sz) {
+    *out_ptr = NULL;
+    *out_sz = 0;
+    if (G.md_find_data) {
+        uint64_t ptr = 0, sz = 0;
+        if ((uint8_t)rt_call(c, G.md_find_data, 4, md, U(key), U(&ptr), U(&sz)) && ptr && sz > 0 && sz <= (1 << 20)) {
+            *out_ptr = (const uint8_t *)(uintptr_t)ptr;
+            *out_sz = (int)sz;
+            return 1;
+        }
+    }
+    if (G.md_find_buffer) {
+        uint64_t buf_obj = 0;
+        if ((uint8_t)rt_call(c, G.md_find_buffer, 3, md, U(key), U(&buf_obj)) && buf_obj) {
+            uint64_t ptr = G.buf_data ? rt_call(c, G.buf_data, 1, buf_obj)
+                                      : rt_call(c, G.buf_base, 1, buf_obj) +
+                                            (G.buf_offset ? (uint64_t)(int32_t)rt_call(c, G.buf_offset, 1, buf_obj) : 0);
+            int sz = G.buf_size ? (int)(int32_t)rt_call(c, G.buf_size, 1, buf_obj) : 0;
+            if (sz <= 0) {
+                uint64_t cap = rt_call(c, G.buf_capacity, 1, buf_obj);
+                if (cap > 0 && cap <= (1 << 20)) sz = (int)cap;
+            }
+            if (ptr && sz > 0 && sz <= (1 << 20)) {
+                *out_ptr = (const uint8_t *)(uintptr_t)ptr;
+                *out_sz = sz;
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 static void extract_avc_csd(Cpu *c, uint64_t md, uint8_t **out, int *out_len) {
     *out = NULL;
     *out_len = 0;
-    if (!G.md_find_data) return;
     static const char *const keys[2] = {"csd-0", "csd-1"};
     for (int i = 0; i < 2; i++) {
-        uint64_t ptr = 0, sz = 0;
-        if ((uint8_t)rt_call(c, G.md_find_data, 4, md, U(keys[i]), U(&ptr), U(&sz)) && ptr && sz > 0 && sz <= (1 << 20))
-            append_annexb_csd(out, out_len, (const uint8_t *)(uintptr_t)ptr, (int)sz);
+        const uint8_t *ptr = NULL;
+        int sz = 0;
+        if (find_md_bytes(c, md, keys[i], &ptr, &sz)) append_annexb_csd(out, out_len, ptr, sz);
     }
-    uint64_t avcc_p = 0, avcc_sz = 0;
-    if (!*out_len && (uint8_t)rt_call(c, G.md_find_data, 4, md, U("avcc"), U(&avcc_p), U(&avcc_sz)) && avcc_p &&
-        avcc_sz >= 7 && avcc_sz <= (1 << 20))
-        avcc_config_to_annexb((const uint8_t *)(uintptr_t)avcc_p, (int)avcc_sz, out, out_len);
+    if (!*out_len) {
+        const uint8_t *avcc_p = NULL;
+        int avcc_sz = 0;
+        if (find_md_bytes(c, md, "avcc", &avcc_p, &avcc_sz) && avcc_sz >= 7)
+            avcc_config_to_annexb(avcc_p, avcc_sz, out, out_len);
+    }
 }
 static const uint8_t *to_annexb_packet(Movie *m, const uint8_t *src, int len, int *out_len) {
     *out_len = len;
