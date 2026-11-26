@@ -129,6 +129,44 @@ NVN_API(nvnTextureBuilderGetViewOffset) {
 NVN_API(nvnTextureBuilderGetZCullStorageSize) { ret_x(c, 0); }
 NVN_API(nvnTextureGetZCullStorageSize) { ret_x(c, 0); }
 
+// void nvnTextureBuilderGetSparseTileLayout / nvnTextureGetSparseTileLayout (Tegra X1 64 KiB sparse page)
+static void sparse_tile_layout(const nvn_texdesc *d, NVNtextureSparseTileLayout *out) {
+    if (!out) return;
+    int bw = 1, bh = 1, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+    if (bpb <= 0) bpb = 4;
+    int tw_blk, th_blk, td;
+    if (d->target == NVN_TEXTURE_TARGET_3D) {
+        tw_blk = (bpb <= 2) ? 64 : (bpb <= 8) ? 32 : 16;
+        th_blk = 32;
+        td = 65536 / (tw_blk * th_blk * bpb);
+        if (td < 1) td = 1;
+    } else {
+        tw_blk = (bpb <= 2) ? 256 : (bpb <= 8) ? 128 : 64;
+        th_blk = 65536 / (tw_blk * bpb);
+        if (th_blk < 1) th_blk = 1;
+        td = 1;
+    }
+    int tw = tw_blk * bw, th = th_blk * bh;
+    uint32_t levels = d->levels ? d->levels : 1;
+    int tiled = 0;
+    uint32_t w = d->width ? d->width : 1, h = d->height ? d->height : 1, z = d->depth ? d->depth : 1;
+    for (uint32_t i = 0; i < levels; i++) {
+        uint32_t mw = w >> i; if (!mw) mw = 1;
+        uint32_t mh = (d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY) ? 1 : (h >> i);
+        if (!mh) mh = 1;
+        uint32_t md = (d->target == NVN_TEXTURE_TARGET_3D) ? (z >> i) : 1;
+        if (!md) md = 1;
+        if ((int)mw < tw || (int)mh < th || (int)md < td) break;
+        tiled++;
+    }
+    out->numTiledLevels = tiled;
+    out->tileWidth = tw;
+    out->tileHeight = th;
+    out->tileDepth = td;
+}
+NVN_API(nvnTextureBuilderGetSparseTileLayout) { sparse_tile_layout(&tb_of(c)->d, arg_p(c, 1)); }
+NVN_API(nvnTextureGetSparseTileLayout) { sparse_tile_layout(&tex_of(c)->d, arg_p(c, 1)); }
+
 // ---------- window queries
 static const win_builder_t *wb_of(const Cpu *c) { return arg_p(c, 0); }
 static const win_t *win_of(const Cpu *c) { return arg_p(c, 0); }

@@ -36,7 +36,8 @@
 // expects the same. The three tables carry the same rows, so cb_module_inits walks them by the size of one.
 typedef struct { const char *name; uint64_t entries; } InitCount;
 static const InitCount inits_100[] = {{"main", 3802}, {"subsdk0", 45}, {"sdk", 112}};
-#define expected_inits inits_100
+static const InitCount inits_150[] = {{"main", 4404}, {"subsdk0", 45}, {"sdk", 112}};
+#define expected_inits (rt_game_version == 150 ? inits_150 : inits_100)
 
 static volatile int32_t inits_done, checkpoint_seen;
 static int sdk_first;   // a mod plugin ran: sdk's DT_INIT came first (cb_module_inits)

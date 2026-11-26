@@ -212,7 +212,7 @@ AR = (UCRT / 'llvm-ar.exe' if (UCRT / 'llvm-ar.exe').is_file() else UCRT / 'ar.e
 WINDRES = UCRT / 'windres.exe'   # runtime/nssports.rc: the manifest of nssports.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
-DISPLAY_VERSIONS = {'v0': '1.0.0'}
+DISPLAY_VERSIONS = {'v0': '1.0.0', 'v589824': '1.5.0'}
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
